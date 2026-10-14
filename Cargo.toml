@@ -1,6 +1,6 @@
 [package]
 name = "clipbridge"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 
@@ -11,6 +11,7 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 getrandom = "0.2"
 image = { version = "0.25", default-features = false, features = ["png"] }
 sha2 = "0.10"
+spake2 = "0.4"
 
 [target.'cfg(target_os="macos")'.dependencies]
 objc2 = "0.6.5"

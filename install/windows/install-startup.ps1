@@ -1,41 +1,45 @@
-# Registers ClipBridge to start hidden at logon and connect to your Mac.
-#   .\install-startup.ps1 -MacHost my-mac -Key <passphrase> [-Exe C:\Tools\clipbridge.exe]
-# The key is saved to %LOCALAPPDATA%\ClipBridge\key.txt, readable only by you (and SYSTEM),
-# and the task passes --key-file so the key never appears on a command line.
+# Sets up ClipBridge on Windows: pairs with your Mac (if not done yet) and registers
+# a logon task that runs hidden and keeps reconnecting.
+#   .\install-startup.ps1 -MacHost brians-mbp.local [-Pair] [-Exe C:\Tools\clipbridge.exe]
+# Before running it, start `clipbridge listen` on the Mac so it shows a pairing code.
+# -Pair pairs again even if a key is already stored (e.g. after re-pairing the Mac).
+# Running it again with a newer clipbridge.exe next to the script upgrades the install.
 # Remove with:  Unregister-ScheduledTask -TaskName ClipBridge -Confirm:$false
 param(
     [Parameter(Mandatory)] [string] $MacHost,
-    [Parameter(Mandatory)] [string] $Key,
+    [switch] $Pair,
     [string] $Exe = "$env:LOCALAPPDATA\ClipBridge\clipbridge.exe"
 )
 
 $ErrorActionPreference = "Stop"
 
-if ($Key.Trim().Length -lt 12) { throw "The key must be at least 12 characters. Generate one with: clipbridge genkey" }
-
 $dataDir = "$env:LOCALAPPDATA\ClipBridge"
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 
-if (-not (Test-Path $Exe)) {
-    $dir = Split-Path $Exe
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $here = Join-Path $PSScriptRoot "clipbridge.exe"
-    if (Test-Path $here) { Copy-Item $here $Exe } else { throw "clipbridge.exe not found at $Exe or next to this script" }
+# Stop a running copy so the exe can be replaced and the task re-registered cleanly.
+if (Get-ScheduledTask -TaskName ClipBridge -ErrorAction SilentlyContinue) { Stop-ScheduledTask -TaskName ClipBridge }
+Get-Process clipbridge -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Milliseconds 500
+
+$here = Join-Path $PSScriptRoot "clipbridge.exe"
+if (Test-Path $here) {
+    New-Item -ItemType Directory -Force -Path (Split-Path $Exe) | Out-Null
+    Copy-Item $here $Exe -Force
+} elseif (-not (Test-Path $Exe)) {
+    throw "clipbridge.exe not found at $Exe or next to this script"
 }
 
-# Create the key file empty, lock it down, and only then write the key into it.
-# /inheritance:r drops inherited entries; /grant:r leaves exactly the current user and SYSTEM.
+# Pairing saves the key to key.txt in the data folder, readable only by you and SYSTEM.
 $keyFile = Join-Path $dataDir "key.txt"
-if (-not (Test-Path $keyFile)) { New-Item -ItemType File -Path $keyFile | Out-Null }
-$me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-& icacls $keyFile /inheritance:r /grant:r "*${me}:(F)" "*S-1-5-18:(F)" | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "icacls could not restrict access to $keyFile" }
-# UTF-8 without a byte order mark, no trailing newline.
-[System.IO.File]::WriteAllText($keyFile, $Key.Trim())
+if ($Pair -or -not (Test-Path $keyFile)) {
+    Write-Host 'Not paired yet. On the Mac, run "clipbridge listen" and read the pairing code it shows.'
+    & $Exe pair $MacHost
+    if ($LASTEXITCODE -ne 0) { throw "pairing failed; run the script again once the Mac shows a code" }
+}
 
 $log = "$dataDir\clipbridge.log"
 $action = New-ScheduledTaskAction -Execute $Exe `
-    -Argument "connect $MacHost --key-file `"$keyFile`" --background --log `"$log`""
+    -Argument "connect $MacHost --background --log `"$log`""
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
@@ -45,4 +49,4 @@ $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interac
 Register-ScheduledTask -TaskName "ClipBridge" -Action $action -Trigger $trigger -Settings $settings `
     -Principal $principal -Force | Out-Null
 Start-ScheduledTask -TaskName "ClipBridge"
-Write-Host "ClipBridge installed and started. Key: $keyFile  Log: $log"
+Write-Host "ClipBridge installed and started. Log: $log"

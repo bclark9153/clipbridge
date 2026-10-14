@@ -1,19 +1,20 @@
 //! ClipBridge — two-way clipboard sync (text, rich text, screenshots/images, files) between
 //! two machines, designed to run alongside a remote-desktop app like Jump Desktop.
 //!
-//!   Mac:      clipbridge listen  --key-file ~/.config/clipbridge/key
-//!   Windows:  clipbridge connect <mac-host> --key-file %LOCALAPPDATA%\ClipBridge\key.txt
+//!   Mac:      clipbridge listen             (shows a pairing code the first time)
+//!   Windows:  clipbridge connect <mac-host>  (asks for that code the first time)
 
 mod clip;
 mod net;
+mod pair;
 mod proto;
 
 use clap::{Parser, Subcommand};
 use proto::{Content, Message};
 use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::{Ipv6Addr, Shutdown, TcpListener, TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
@@ -27,6 +28,8 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Listener connections allowed to be unauthenticated (pre-Hello) at once.
 const MAX_PENDING: usize = 8;
 const MIN_KEY_CHARS: usize = 12;
+/// How long each step of a pairing exchange may take.
+const PAIR_TIMEOUT: Duration = Duration::from_secs(60);
 const MB: usize = 1024 * 1024;
 
 // ---------- logging ----------
@@ -67,12 +70,12 @@ struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
 
-    /// Shared passphrase (same on both machines). Can also be set via CLIPBRIDGE_KEY.
-    /// Prefer --key-file: a key on the command line is visible to other processes.
+    /// Shared passphrase (same on both machines). Normally not needed: pairing with
+    /// a code stores a key automatically. Can also be set via CLIPBRIDGE_KEY.
     #[arg(long, env = "CLIPBRIDGE_KEY", global = true, hide_env_values = true)]
     key: Option<String>,
 
-    /// Read the shared passphrase from this file (trailing whitespace is ignored).
+    /// Read the shared passphrase from this file instead of the one saved by pairing.
     /// Can also be set via CLIPBRIDGE_KEY_FILE.
     #[arg(long, env = "CLIPBRIDGE_KEY_FILE", global = true)]
     key_file: Option<PathBuf>,
@@ -108,19 +111,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Wait for the other machine to connect (run this on the Mac).
+    /// Wait for the other machine to connect (run this on the Mac). The first time
+    /// it shows a pairing code to enter on the other machine.
     Listen {
         /// Address to listen on.
         #[arg(default_value_t = format!("0.0.0.0:{DEFAULT_PORT}"))]
         bind: String,
+        /// Show a new pairing code even though a key is already stored (replaces it).
+        #[arg(long)]
+        pair: bool,
     },
     /// Connect to the listening machine (run this on Windows). Reconnects automatically.
+    /// The first time it asks for the pairing code shown by the listener.
     Connect {
-        /// Host or host:port of the listener, e.g. my-mac, 100.64.1.5:47800 or
+        /// Host or host:port of the listener, e.g. my-mac.local, 100.64.1.5:47800 or
         /// [fd7a:115c::5]:47800 (put IPv6 addresses in brackets when adding a port).
         addr: String,
+        /// The pairing code shown on the listener, instead of being asked for it.
+        #[arg(long)]
+        code: Option<String>,
+        /// Pair again even though a key is already stored (replaces it).
+        #[arg(long)]
+        pair: bool,
     },
-    /// Print a random passphrase to use as --key.
+    /// Pair with the listening machine using the code it shows, save the key, and exit.
+    /// (`connect` does the same the first time; this one is for scripts and installers.)
+    Pair {
+        /// Host or host:port of the listener.
+        addr: String,
+        /// The pairing code shown on the listener, instead of being asked for it.
+        #[arg(long)]
+        code: Option<String>,
+    },
+    /// Print a random passphrase to use as --key (only for manual setups without pairing).
     Genkey,
 }
 
@@ -184,12 +207,61 @@ fn main() {
         }
     }
 
-    let key = match load_key(&cli) {
+    if let Cmd::Pair { addr, code } = &cli.cmd {
+        match pair_connector(&full_addr(addr), code.clone(), &key_path(&cli)) {
+            Ok(_) => {
+                log!("done. From now on just run: clipbridge connect {addr}");
+                return;
+            }
+            Err(e) => {
+                log!("{e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // Kept short so the Hello always fits under net::HELLO_FRAME_LIMIT.
+    let name: String = cli.name.clone().unwrap_or_else(hostname).chars().take(200).collect();
+
+    // The key: given explicitly, saved by an earlier pairing, or made now by pairing.
+    let key_path = key_path(&cli);
+    let configured = match load_key(&cli, &key_path) {
         Ok(k) => k,
         Err(e) => {
             log!("{e}");
             std::process::exit(2);
         }
+    };
+    let (key, listener) = match &cli.cmd {
+        Cmd::Listen { bind, pair } => {
+            let listener = match TcpListener::bind(bind.as_str()) {
+                Ok(l) => l,
+                Err(e) => {
+                    log!("can't listen on {bind}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            log!("listening on {bind}");
+            let key = match (configured, *pair) {
+                (Some(k), false) => k,
+                _ => pair_listener(&listener, &name, &key_path),
+            };
+            (key, Some(listener))
+        }
+        Cmd::Connect { addr, code, pair } => {
+            let key = match (configured, *pair) {
+                (Some(k), false) => k,
+                _ => match pair_connector(&full_addr(addr), code.clone(), &key_path) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        log!("{e}");
+                        std::process::exit(2);
+                    }
+                },
+            };
+            (key, None)
+        }
+        Cmd::Genkey | Cmd::Pair { .. } => unreachable!(),
     };
 
     // Detach only after the checks above, so their errors still reach the console.
@@ -215,8 +287,7 @@ fn main() {
         own_change: Mutex::new(None),
         out: Mutex::new(None),
         next_id: AtomicU64::new(1),
-        // Kept short so the Hello always fits under net::HELLO_FRAME_LIMIT.
-        name: cli.name.clone().unwrap_or_else(hostname).chars().take(200).collect(),
+        name,
         psk: net::psk_from_passphrase(&key),
         max_frame: frame_limit(cli.max_mb),
         plain_text: cli.plain_text,
@@ -231,32 +302,35 @@ fn main() {
     }
 
     match cli.cmd {
-        Cmd::Listen { bind } => listen(&bind, shared),
-        Cmd::Connect { addr } => connect_loop(&addr, shared),
-        Cmd::Genkey => unreachable!(),
+        Cmd::Listen { .. } => listen(listener.expect("bound above"), shared),
+        Cmd::Connect { addr, .. } => connect_loop(&addr, shared),
+        Cmd::Genkey | Cmd::Pair { .. } => unreachable!(),
     }
 }
 
-/// The passphrase from --key or --key-file (or their environment variables).
-fn load_key(cli: &Cli) -> Result<String, String> {
+/// Where the key lives: --key-file (or CLIPBRIDGE_KEY_FILE), else the default
+/// location. Pairing saves the key there when the file doesn't exist yet.
+fn key_path(cli: &Cli) -> PathBuf {
+    cli.key_file.clone().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(default_key_path)
+}
+
+/// The passphrase from --key (or CLIPBRIDGE_KEY), else the key file; None when
+/// there is no key yet and pairing is needed.
+fn load_key(cli: &Cli, key_path: &Path) -> Result<Option<String>, String> {
     let key_arg = cli.key.as_deref().filter(|k| !k.is_empty());
-    let key_file = cli.key_file.as_deref().filter(|p| !p.as_os_str().is_empty());
-    let key = match (key_arg, key_file) {
-        (Some(_), Some(_)) => {
+    let key_file_given = cli.key_file.as_deref().is_some_and(|p| !p.as_os_str().is_empty());
+    let key = match key_arg {
+        Some(_) if key_file_given => {
             return Err("Use either --key or --key-file, not both (check the CLIPBRIDGE_KEY and \
                         CLIPBRIDGE_KEY_FILE environment variables too)."
                 .into());
         }
-        (Some(k), None) => k.to_string(),
-        (None, Some(path)) => {
-            let raw = std::fs::read_to_string(path)
-                .map_err(|e| format!("can't read key file {}: {e}", path.display()))?;
-            raw.trim_start_matches('\u{feff}').trim_end().to_string()
-        }
-        (None, None) => {
-            return Err("A shared passphrase is required: --key-file <path> or --key <secret> \
-                        (or CLIPBRIDGE_KEY_FILE / CLIPBRIDGE_KEY).\nGenerate one with: clipbridge genkey"
-                .into());
+        Some(k) => k.to_string(),
+        None => {
+            if !key_path.is_file() {
+                return Ok(None);
+            }
+            read_key_file(key_path)?
         }
     };
     if key.chars().count() < MIN_KEY_CHARS {
@@ -264,7 +338,180 @@ fn load_key(cli: &Cli) -> Result<String, String> {
             "The passphrase must be at least {MIN_KEY_CHARS} characters. Generate a strong one with: clipbridge genkey"
         ));
     }
-    Ok(key)
+    Ok(Some(key))
+}
+
+fn read_key_file(path: &Path) -> Result<String, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("can't read key file {}: {e}", path.display()))?;
+    Ok(raw.trim_start_matches('\u{feff}').trim_end().to_string())
+}
+
+/// Where pairing keeps the key: %LOCALAPPDATA%\ClipBridge\key.txt on Windows,
+/// ~/.config/clipbridge/key elsewhere.
+fn default_key_path() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(d) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(d).join("ClipBridge").join("key.txt");
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    home.join(".config").join("clipbridge").join("key")
+}
+
+/// Save a pairing key so that only this user can read it.
+fn store_key(path: &Path, key: &str) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+        f.write_all(key.as_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, key)?;
+        // Drop inherited permissions and leave exactly this user and SYSTEM.
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        let me = match std::env::var("USERDOMAIN") {
+            Ok(d) if !d.is_empty() => format!("{d}\\{user}"),
+            _ => user,
+        };
+        let ok = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r"])
+            .arg(format!("{me}:(F)"))
+            .arg("*S-1-5-18:(F)")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            log!("warning: couldn't restrict who can read {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn save_pairing(path: &Path, key: &str) {
+    match store_key(path, key) {
+        Ok(()) => log!("pairing key saved to {}", path.display()),
+        Err(e) => log!(
+            "warning: couldn't save the pairing key to {} ({e}); you'll have to pair again next start",
+            path.display()
+        ),
+    }
+}
+
+fn show_code(code: &str, name: &str) {
+    log!("");
+    log!("    Pairing code for \"{name}\":   {}", pair::pretty(code));
+    log!("");
+    log!("On the other machine run `clipbridge connect <this machine>` and enter the code.");
+}
+
+/// Show a pairing code and accept attempts until one succeeds. Returns the new key.
+fn pair_listener(listener: &TcpListener, name: &str, key_path: &Path) -> String {
+    let mut code = pair::new_code();
+    log!("not paired yet; waiting for the other machine");
+    show_code(&code, name);
+    loop {
+        let (mut stream, peer) = match listener.accept() {
+            Ok(x) => x,
+            Err(e) => {
+                log!("accept failed: {e}");
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+        };
+        let _ = stream.set_read_timeout(Some(PAIR_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(PAIR_TIMEOUT));
+        let result = pair::server(&mut stream, &code);
+        let _ = stream.shutdown(Shutdown::Both);
+        match result {
+            Ok(ltk) => {
+                let key = hex(&ltk);
+                save_pairing(key_path, &key);
+                log!("paired with {peer}");
+                return key;
+            }
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                log!("{peer}: wrong pairing code; here is a new one");
+                thread::sleep(Duration::from_secs(2));
+                code = pair::new_code();
+                show_code(&code, name);
+            }
+            Err(e) => {
+                log!("{peer}: {e}");
+                show_code(&code, name);
+            }
+        }
+    }
+}
+
+/// Ask for the code shown on `addr` and pair with it. Returns the new key.
+fn pair_connector(addr: &str, code: Option<String>, key_path: &Path) -> Result<String, String> {
+    let interactive = io::stdin().is_terminal();
+    if code.is_none() && !interactive {
+        return Err(format!(
+            "not paired yet. Open a terminal and run:  clipbridge connect {addr}\n\
+             then enter the pairing code shown by `clipbridge listen` on the other machine."
+        ));
+    }
+    log!("not paired yet; pairing with {addr}");
+    for _ in 0..5 {
+        let typed = match &code {
+            Some(c) => c.clone(),
+            None => {
+                eprint!("Enter the pairing code shown on the other machine: ");
+                let _ = io::stderr().flush();
+                let mut line = String::new();
+                io::stdin().lock().read_line(&mut line).map_err(|e| format!("couldn't read the code: {e}"))?;
+                if line.is_empty() {
+                    return Err("no code entered".into());
+                }
+                line
+            }
+        };
+        let digits = pair::normalize(&typed);
+        if digits.len() != pair::CODE_DIGITS {
+            eprintln!("The code is {} digits.", pair::CODE_DIGITS);
+            if code.is_some() {
+                return Err("--code must be the 6-digit pairing code".into());
+            }
+            continue;
+        }
+        let mut stream = connect_any(addr).map_err(|e| format!("can't reach {addr}: {e}"))?;
+        let _ = stream.set_read_timeout(Some(PAIR_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(PAIR_TIMEOUT));
+        let result = pair::client(&mut stream, &digits);
+        let _ = stream.shutdown(Shutdown::Both);
+        match result {
+            Ok(ltk) => {
+                let key = hex(&ltk);
+                save_pairing(key_path, &key);
+                log!("paired with {addr}");
+                return Ok(key);
+            }
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                eprintln!("Wrong code. The other machine now shows a new one.");
+                if code.is_some() {
+                    return Err("the pairing code was rejected".into());
+                }
+            }
+            Err(e) => return Err(format!("pairing with {addr} failed: {e}")),
+        }
+    }
+    Err("too many wrong codes; start again".into())
 }
 
 /// Frame size limit after authentication: room for --max-mb of files, or a
@@ -375,15 +622,7 @@ fn apply_remote(shared: &Shared, content: Content) {
 
 // ---------- networking ----------
 
-fn listen(bind: &str, shared: Arc<Shared>) {
-    let listener = match TcpListener::bind(bind) {
-        Ok(l) => l,
-        Err(e) => {
-            log!("can't listen on {bind}: {e}");
-            std::process::exit(1);
-        }
-    };
-    log!("listening on {bind}");
+fn listen(listener: TcpListener, shared: Arc<Shared>) {
     let pending = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         match conn {
@@ -488,14 +727,19 @@ impl Outbox {
     }
 }
 
-fn connect_loop(addr: &str, shared: Arc<Shared>) {
-    let addr = if addr.parse::<Ipv6Addr>().is_ok() {
+/// `host`, `host:port`, a bare IPv6 address or `[v6]:port` as a `host:port` string.
+fn full_addr(addr: &str) -> String {
+    if addr.parse::<Ipv6Addr>().is_ok() {
         format!("[{addr}]:{DEFAULT_PORT}") // bare IPv6 address, no port
     } else if addr.contains(':') && !addr.ends_with(']') {
         addr.to_string()
     } else {
         format!("{addr}:{DEFAULT_PORT}")
-    };
+    }
+}
+
+fn connect_loop(addr: &str, shared: Arc<Shared>) {
+    let addr = full_addr(addr);
     let mut backoff = Duration::from_secs(2);
     loop {
         let started = Instant::now();

@@ -14,7 +14,7 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 
 /// Protocol tag. Bumped whenever old and new versions can't talk to each other.
-const MAGIC: &[u8; 4] = b"CBR2";
+pub const MAGIC: &[u8; 4] = b"CBR2";
 /// Absolute ceiling on a single frame, whatever the configured limit.
 pub const MAX_FRAME: usize = 1024 * 1024 * 1024;
 /// Frame limit until the peer has proved it knows the key. The first frame is
@@ -80,7 +80,7 @@ impl Opener {
         let pt = self.cipher.decrypt(&nonce(self.counter), ct.as_slice()).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "could not decrypt frame (passphrase mismatch?)",
+                "could not decrypt frame: the two machines have different keys (pair again with --pair)",
             )
         })?;
         self.counter += 1;
@@ -96,13 +96,13 @@ pub fn psk_from_passphrase(pass: &str) -> [u8; 32] {
 
 /// HMAC-SHA256 (RFC 2104) with the padded key already absorbed, so each use
 /// only hashes the message.
-struct Hmac {
+pub(crate) struct Hmac {
     inner: Sha256,
     outer: Sha256,
 }
 
 impl Hmac {
-    fn new(key: &[u8]) -> Self {
+    pub(crate) fn new(key: &[u8]) -> Self {
         let mut block = [0u8; 64];
         if key.len() > block.len() {
             block[..32].copy_from_slice(Sha256::digest(key).as_slice());
@@ -122,7 +122,7 @@ impl Hmac {
         Hmac { inner, outer }
     }
 
-    fn mac(&self, parts: &[&[u8]]) -> [u8; 32] {
+    pub(crate) fn mac(&self, parts: &[&[u8]]) -> [u8; 32] {
         let mut inner = self.inner.clone();
         for p in parts {
             inner.update(*p);
@@ -169,10 +169,12 @@ pub fn handshake(stream: &mut TcpStream, role: Role, psk: &[u8; 32]) -> io::Resu
     let mut theirs = [0u8; 36];
     stream.read_exact(&mut theirs)?;
     if &theirs[..4] != MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "peer is not ClipBridge v2 (both machines must run the same version)",
-        ));
+        let msg = if &theirs[..4] == crate::pair::MAGIC {
+            "peer wants to pair, but this machine already has a key (start it with --pair to pair again)"
+        } else {
+            "peer is not ClipBridge v2 (both machines must run the same version)"
+        };
+        return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
     }
     let theirs = &theirs[4..];
 
