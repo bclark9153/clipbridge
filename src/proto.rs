@@ -70,7 +70,11 @@ impl Content {
     pub fn describe(&self) -> String {
         match self {
             Content::Text(t) => format!("text ({} chars)", t.chars().count()),
-            Content::Rich { text, .. } => format!("rich text ({} chars)", text.chars().count()),
+            Content::Rich { text, html } => {
+                // HTML-only items have no plain text; count the HTML instead.
+                let shown = if text.is_empty() { html } else { text };
+                format!("rich text ({} chars)", shown.chars().count())
+            }
             Content::Image { width, height, .. } => format!("image {width}x{height}"),
             Content::Files(f) => {
                 let total: usize = f.iter().map(|(_, d)| d.len()).sum();

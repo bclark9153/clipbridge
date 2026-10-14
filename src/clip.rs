@@ -133,6 +133,14 @@ impl Clip {
                     rgba: img.bytes.into_owned(),
                 });
             }
+        // HTML with no plain-text version (some scripts and clipboard tools do
+        // this). Checked after images so a copied browser image, which also
+        // carries an <img> snippet, still syncs as a picture.
+        if self.rich
+            && let Ok(html) = self.cb.get().html()
+            && !html.is_empty() {
+                return Some(Content::Rich { text: String::new(), html });
+            }
         None
     }
 
@@ -180,8 +188,11 @@ impl Clip {
                 // HTML plus the plain-text version for apps that only take text.
                 // arboard adds the CF_HTML header on Windows and uses public.html on macOS.
                 let alt = to_native(text);
-                let result = self.cb.set().html(html.as_str(), Some(alt.as_str()));
+                let result = self.cb.set().html(html.as_str(), (!alt.is_empty()).then_some(alt.as_str()));
                 if let Err(e) = result {
+                    if alt.is_empty() {
+                        return Err(e.to_string());
+                    }
                     log!("couldn't put formatted text on the clipboard ({e}); using plain text");
                     return self.cb.set_text(alt).map_err(|e| e.to_string());
                 }

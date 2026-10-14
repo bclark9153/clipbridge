@@ -54,7 +54,7 @@ sends them as PNG, and writes them back natively. On Windows that means writing 
 
 4. **On Windows:**
    ```
-   clipbridge connect <mac-hostname-or-ip> --key-file %LOCALAPPDATA%\ClipBridge\key.txt
+   clipbridge connect <mac-hostname-or-ip> --key-file "$env:LOCALAPPDATA\ClipBridge\key.txt"
    ```
    Both windows should log `connected to "<other machine>"`. Copy something and you'll
    see `→ sending …` on one side and `← received …` on the other.
