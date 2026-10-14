@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Copy to ~/Library/LaunchAgents/ and load with:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.simplebit.clipbridge.plist
+  Replace REPLACE_WITH_KEY with the output of `clipbridge genkey`.
+  It must be a LaunchAgent (runs in your login session), not a LaunchDaemon,
+  or it can't see your clipboard.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.simplebit.clipbridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/clipbridge</string>
+    <string>listen</string>
+    <string>--log</string>
+    <string>/tmp/clipbridge.log</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLIPBRIDGE_KEY</key>
+    <string>REPLACE_WITH_KEY</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+</dict>
+</plist>

@@ -1,0 +1,33 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: clipbridge.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: clipbridge
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bin: clipbridge
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo test --release
+        if: matrix.target != 'x86_64-apple-darwin'
+      - run: cargo build --release --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clipbridge-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.bin }}
