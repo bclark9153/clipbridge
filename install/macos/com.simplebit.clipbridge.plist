@@ -1,9 +1,20 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Copy to ~/Library/LaunchAgents/ and load with:
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.simplebit.clipbridge.plist
-  Replace REPLACE_WITH_KEY with the output of `clipbridge genkey`.
+  1. Put the shared key (the output of `clipbridge genkey`, same on both machines)
+     in a file only you can read:
+       mkdir -p ~/.config/clipbridge
+       (umask 077; nano ~/.config/clipbridge/key)
+       chmod 600 ~/.config/clipbridge/key
+  2. Replace REPLACE_WITH_USER below with your macOS user name (launchd does not
+     expand ~ or $HOME).
+  3. Copy to ~/Library/LaunchAgents/ and load with:
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.simplebit.clipbridge.plist
+
+  Alternative: drop the two key-file lines from ProgramArguments and add an
+  EnvironmentVariables dict that sets CLIPBRIDGE_KEY to the key. That works too,
+  but the key then sits in this plist in plain text.
+
   It must be a LaunchAgent (runs in your login session), not a LaunchDaemon,
   or it can't see your clipboard.
 -->
@@ -15,14 +26,11 @@
   <array>
     <string>/usr/local/bin/clipbridge</string>
     <string>listen</string>
+    <string>--key-file</string>
+    <string>/Users/REPLACE_WITH_USER/.config/clipbridge/key</string>
     <string>--log</string>
     <string>/tmp/clipbridge.log</string>
   </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>CLIPBRIDGE_KEY</key>
-    <string>REPLACE_WITH_KEY</string>
-  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>

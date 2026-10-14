@@ -1,8 +1,8 @@
 //! ClipBridge — two-way clipboard sync (text, screenshots/images, files) between
 //! two machines, designed to run alongside a remote-desktop app like Jump Desktop.
 //!
-//!   Mac:      clipbridge listen  --key <secret>
-//!   Windows:  clipbridge connect <mac-host> --key <secret>
+//!   Mac:      clipbridge listen  --key-file ~/.config/clipbridge/key
+//!   Windows:  clipbridge connect <mac-host> --key-file %LOCALAPPDATA%\ClipBridge\key.txt
 
 mod clip;
 mod net;
@@ -14,7 +14,7 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -23,6 +23,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_PORT: u16 = 47800;
 const PING_EVERY: Duration = Duration::from_secs(15);
 const PEER_TIMEOUT: Duration = Duration::from_secs(45);
+/// How long a new connection gets to complete the handshake and say Hello.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Listener connections allowed to be unauthenticated (pre-Hello) at once.
+const MAX_PENDING: usize = 8;
+const MIN_KEY_CHARS: usize = 12;
+const MB: usize = 1024 * 1024;
 
 // ---------- logging ----------
 
@@ -57,8 +63,14 @@ struct Cli {
     cmd: Cmd,
 
     /// Shared passphrase (same on both machines). Can also be set via CLIPBRIDGE_KEY.
+    /// Prefer --key-file: a key on the command line is visible to other processes.
     #[arg(long, env = "CLIPBRIDGE_KEY", global = true, hide_env_values = true)]
     key: Option<String>,
+
+    /// Read the shared passphrase from this file (trailing whitespace is ignored).
+    /// Can also be set via CLIPBRIDGE_KEY_FILE.
+    #[arg(long, env = "CLIPBRIDGE_KEY_FILE", global = true)]
+    key_file: Option<PathBuf>,
 
     /// Name shown to the other side (defaults to the hostname).
     #[arg(long, global = true)]
@@ -115,6 +127,8 @@ struct Shared {
     next_id: AtomicU64,
     name: String,
     psk: [u8; 32],
+    /// Largest frame sent or accepted once the peer has authenticated.
+    max_frame: usize,
 }
 
 fn main() {
@@ -128,13 +142,6 @@ fn main() {
         return;
     }
 
-    if cli.background {
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::System::Console::FreeConsole();
-        }
-    }
-
     if let Some(path) = &cli.log {
         match OpenOptions::new().create(true).append(true).open(path) {
             Ok(f) => {
@@ -144,16 +151,24 @@ fn main() {
         }
     }
 
-    let Some(key) = cli.key.clone().filter(|k| !k.is_empty()) else {
-        eprintln!("A shared passphrase is required: --key <secret> or CLIPBRIDGE_KEY.\nGenerate one with: clipbridge genkey");
-        std::process::exit(2);
+    let key = match load_key(&cli) {
+        Ok(k) => k,
+        Err(e) => {
+            log!("{e}");
+            std::process::exit(2);
+        }
     };
-    if key.len() < 12 {
-        log!("warning: passphrase is short; use `clipbridge genkey` for a strong one");
+
+    // Detach only after the checks above, so their errors still reach the console.
+    if cli.background {
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::Console::FreeConsole();
+        }
     }
 
     let receive_dir = cli.receive_dir.clone().unwrap_or_else(default_receive_dir);
-    let clip = match clip::Clip::new(receive_dir.clone(), cli.max_mb * 1024 * 1024) {
+    let clip = match clip::Clip::new(receive_dir.clone(), cli.max_mb.saturating_mul(MB)) {
         Ok(c) => c,
         Err(e) => {
             log!("cannot open the clipboard: {e}");
@@ -167,8 +182,10 @@ fn main() {
         own_change: Mutex::new(None),
         out: Mutex::new(None),
         next_id: AtomicU64::new(1),
-        name: cli.name.clone().unwrap_or_else(hostname),
+        // Kept short so the Hello always fits under net::HELLO_FRAME_LIMIT.
+        name: cli.name.clone().unwrap_or_else(hostname).chars().take(200).collect(),
         psk: net::psk_from_passphrase(&key),
+        max_frame: frame_limit(cli.max_mb),
     });
 
     log!("ClipBridge {} as \"{}\"; received files go to {}", env!("CARGO_PKG_VERSION"), shared.name, receive_dir.display());
@@ -184,6 +201,42 @@ fn main() {
         Cmd::Connect { addr } => connect_loop(&addr, shared),
         Cmd::Genkey => unreachable!(),
     }
+}
+
+/// The passphrase from --key or --key-file (or their environment variables).
+fn load_key(cli: &Cli) -> Result<String, String> {
+    let key_arg = cli.key.as_deref().filter(|k| !k.is_empty());
+    let key_file = cli.key_file.as_deref().filter(|p| !p.as_os_str().is_empty());
+    let key = match (key_arg, key_file) {
+        (Some(_), Some(_)) => {
+            return Err("Use either --key or --key-file, not both (check the CLIPBRIDGE_KEY and \
+                        CLIPBRIDGE_KEY_FILE environment variables too)."
+                .into());
+        }
+        (Some(k), None) => k.to_string(),
+        (None, Some(path)) => {
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| format!("can't read key file {}: {e}", path.display()))?;
+            raw.trim_start_matches('\u{feff}').trim_end().to_string()
+        }
+        (None, None) => {
+            return Err("A shared passphrase is required: --key-file <path> or --key <secret> \
+                        (or CLIPBRIDGE_KEY_FILE / CLIPBRIDGE_KEY).\nGenerate one with: clipbridge genkey"
+                .into());
+        }
+    };
+    if key.chars().count() < MIN_KEY_CHARS {
+        return Err(format!(
+            "The passphrase must be at least {MIN_KEY_CHARS} characters. Generate a strong one with: clipbridge genkey"
+        ));
+    }
+    Ok(key)
+}
+
+/// Frame size limit after authentication: room for --max-mb of files, or a
+/// large screenshot (at least 256 MB), plus 1 MB for framing and names.
+fn frame_limit(max_mb: usize) -> usize {
+    max_mb.max(256).saturating_mul(MB).saturating_add(MB).min(net::MAX_FRAME)
 }
 
 fn default_receive_dir() -> PathBuf {
@@ -277,13 +330,19 @@ fn listen(bind: &str, shared: Arc<Shared>) {
         }
     };
     log!("listening on {bind}");
+    let pending = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
+                let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+                let Some(slot) = PendingSlot::acquire(&pending) else {
+                    log!("{peer}: rejected, too many connections are still authenticating");
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                };
                 let s = shared.clone();
                 thread::spawn(move || {
-                    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-                    match run_session(stream, net::Role::Listener, &s) {
+                    match run_session(stream, net::Role::Listener, &s, Some(slot)) {
                         Ok(()) => log!("{peer} disconnected"),
                         Err(e) => log!("{peer}: {e}"),
                     }
@@ -291,6 +350,26 @@ fn listen(bind: &str, shared: Arc<Shared>) {
             }
             Err(e) => log!("accept failed: {e}"),
         }
+    }
+}
+
+/// Marks a listener connection that hasn't authenticated yet. Capping these
+/// stops strangers from tying up threads; the slot is released on drop.
+struct PendingSlot(Arc<AtomicUsize>);
+
+impl PendingSlot {
+    fn acquire(count: &Arc<AtomicUsize>) -> Option<PendingSlot> {
+        if count.fetch_add(1, Ordering::SeqCst) >= MAX_PENDING {
+            count.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(PendingSlot(count.clone()))
+    }
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -309,7 +388,7 @@ fn connect_loop(addr: &str, shared: Arc<Shared>) {
                 .next()
                 .ok_or_else(|| io::Error::other("could not resolve address"))?;
             let stream = TcpStream::connect_timeout(&sa, Duration::from_secs(5))?;
-            run_session(stream, net::Role::Connector, &shared)
+            run_session(stream, net::Role::Connector, &shared, None)
         })();
         match result {
             Ok(()) => log!("disconnected from {addr}"),
@@ -324,17 +403,24 @@ fn connect_loop(addr: &str, shared: Arc<Shared>) {
     }
 }
 
-fn run_session(mut stream: TcpStream, role: net::Role, shared: &Arc<Shared>) -> io::Result<()> {
+/// `pending` is the listener's unauthenticated-connection slot, released once
+/// the peer's Hello has been verified.
+fn run_session(
+    mut stream: TcpStream,
+    role: net::Role,
+    shared: &Arc<Shared>,
+    mut pending: Option<PendingSlot>,
+) -> io::Result<()> {
     let peer_addr = stream.peer_addr()?;
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
     let (mut sealer, mut opener) = net::handshake(&mut stream, role, &shared.psk)?;
-    stream.set_read_timeout(Some(PEER_TIMEOUT))?;
 
     let (tx, rx) = mpsc::channel::<Message>();
     tx.send(Message::Hello { name: shared.name.clone() }).ok();
 
     let mut wstream = stream.try_clone()?;
+    let max_frame = shared.max_frame;
     let writer = thread::spawn(move || {
         loop {
             let msg = match rx.recv_timeout(PING_EVERY) {
@@ -349,8 +435,12 @@ fn run_session(mut stream: TcpStream, role: net::Role, shared: &Arc<Shared>) -> 
                     continue;
                 }
             };
-            if bytes.len() + 64 > net::MAX_FRAME {
-                log!("clipboard item too large to send");
+            if bytes.len() + 64 > max_frame {
+                log!(
+                    "clipboard item too large to send ({}, limit {}; raise --max-mb on both machines)",
+                    proto::human_bytes(bytes.len()),
+                    proto::human_bytes(max_frame)
+                );
                 continue;
             }
             if sealer.write_frame(&mut wstream, &bytes).is_err() {
@@ -362,10 +452,14 @@ fn run_session(mut stream: TcpStream, role: net::Role, shared: &Arc<Shared>) -> 
 
     // The first frame must be the peer's Hello; only then does this session take
     // over (so a client with the wrong key can't knock out a good connection).
+    // Until it decrypts, the opener only accepts a tiny frame.
     let first = Message::decode(&opener.read_frame(&mut stream)?)?;
     let Message::Hello { name: peer_name } = first else {
         return Err(proto::bad("peer did not say hello"));
     };
+    drop(pending.take());
+    opener.set_max_frame(shared.max_frame);
+    stream.set_read_timeout(Some(PEER_TIMEOUT))?;
     let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
     // Replacing the old sender drops it, which stops the old session's writer.
     *shared.out.lock().unwrap() = Some((id, tx));

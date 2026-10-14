@@ -1,8 +1,9 @@
 //! Authenticated, encrypted framing over TCP.
 //!
-//! Both sides share a passphrase. On connect, each side sends a magic tag and
-//! 32 random bytes. Per-direction session keys are derived from the passphrase
-//! plus both random values, so keys never repeat across connections. Frames are
+//! Both sides share a passphrase, stretched into a 32-byte key with
+//! PBKDF2-HMAC-SHA256. On connect, each side sends a magic tag and 32 random
+//! bytes. Per-direction session keys are derived from the stretched key plus
+//! both random values, so keys never repeat across connections. Frames are
 //! ChaCha20-Poly1305 sealed with a per-direction counter nonce. A wrong
 //! passphrase shows up as a failure to open the first frame.
 
@@ -12,9 +13,16 @@ use sha2::{Digest, Sha256};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
 
-const MAGIC: &[u8; 4] = b"CBR1";
-/// Hard ceiling on a single frame, to bound memory from a misbehaving peer.
+/// Protocol tag. Bumped whenever old and new versions can't talk to each other.
+const MAGIC: &[u8; 4] = b"CBR2";
+/// Absolute ceiling on a single frame, whatever the configured limit.
 pub const MAX_FRAME: usize = 1024 * 1024 * 1024;
+/// Frame limit until the peer has proved it knows the key. The first frame is
+/// always the small Hello, so a stranger can't make us allocate much memory.
+pub const HELLO_FRAME_LIMIT: usize = 4 * 1024;
+
+const PSK_SALT: &[u8] = b"clipbridge-v2-psk";
+const PSK_ITERATIONS: u32 = 600_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -29,6 +37,7 @@ pub struct Sealer {
 pub struct Opener {
     cipher: ChaCha20Poly1305,
     counter: u64,
+    max_frame: usize,
 }
 
 fn nonce(counter: u64) -> Nonce {
@@ -51,12 +60,20 @@ impl Sealer {
 }
 
 impl Opener {
+    /// Change the largest frame this side accepts (never above `MAX_FRAME`).
+    pub fn set_max_frame(&mut self, n: usize) {
+        self.max_frame = n.min(MAX_FRAME);
+    }
+
     pub fn read_frame(&mut self, r: &mut impl Read) -> io::Result<Vec<u8>> {
         let mut len = [0u8; 4];
         r.read_exact(&mut len)?;
         let len = u32::from_be_bytes(len) as usize;
-        if len > MAX_FRAME {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        if len > self.max_frame {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("frame too large ({len} bytes, limit {})", self.max_frame),
+            ));
         }
         let mut ct = vec![0u8; len];
         r.read_exact(&mut ct)?;
@@ -71,11 +88,64 @@ impl Opener {
     }
 }
 
+/// Stretch the passphrase into the pre-shared key. Deliberately slow (it runs
+/// once at startup) so a recorded handshake can't be brute-forced cheaply.
 pub fn psk_from_passphrase(pass: &str) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(b"clipbridge-v1-psk");
-    h.update(pass.as_bytes());
-    h.finalize().into()
+    pbkdf2_sha256(pass.as_bytes(), PSK_SALT, PSK_ITERATIONS)
+}
+
+/// HMAC-SHA256 (RFC 2104) with the padded key already absorbed, so each use
+/// only hashes the message.
+struct Hmac {
+    inner: Sha256,
+    outer: Sha256,
+}
+
+impl Hmac {
+    fn new(key: &[u8]) -> Self {
+        let mut block = [0u8; 64];
+        if key.len() > block.len() {
+            block[..32].copy_from_slice(Sha256::digest(key).as_slice());
+        } else {
+            block[..key.len()].copy_from_slice(key);
+        }
+        let mut ipad = [0x36u8; 64];
+        let mut opad = [0x5cu8; 64];
+        for i in 0..64 {
+            ipad[i] ^= block[i];
+            opad[i] ^= block[i];
+        }
+        let mut inner = Sha256::new();
+        inner.update(ipad);
+        let mut outer = Sha256::new();
+        outer.update(opad);
+        Hmac { inner, outer }
+    }
+
+    fn mac(&self, parts: &[&[u8]]) -> [u8; 32] {
+        let mut inner = self.inner.clone();
+        for p in parts {
+            inner.update(*p);
+        }
+        let mut outer = self.outer.clone();
+        outer.update(inner.finalize());
+        outer.finalize().into()
+    }
+}
+
+/// PBKDF2 (RFC 8018) with HMAC-SHA256, producing a single 32-byte block.
+fn pbkdf2_sha256(pass: &[u8], salt: &[u8], iterations: u32) -> [u8; 32] {
+    let prf = Hmac::new(pass);
+    let block_index = 1u32.to_be_bytes();
+    let mut u = prf.mac(&[salt, &block_index[..]]);
+    let mut out = u;
+    for _ in 1..iterations {
+        u = prf.mac(&[&u[..]]);
+        for (o, x) in out.iter_mut().zip(u.iter()) {
+            *o ^= *x;
+        }
+    }
+    out
 }
 
 fn derive(psk: &[u8; 32], c_rand: &[u8], s_rand: &[u8], dir: &[u8]) -> ChaCha20Poly1305 {
@@ -99,7 +169,10 @@ pub fn handshake(stream: &mut TcpStream, role: Role, psk: &[u8; 32]) -> io::Resu
     let mut theirs = [0u8; 36];
     stream.read_exact(&mut theirs)?;
     if &theirs[..4] != MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "peer is not ClipBridge v1"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "peer is not ClipBridge v2 (both machines must run the same version)",
+        ));
     }
     let theirs = &theirs[4..];
 
@@ -113,7 +186,10 @@ pub fn handshake(stream: &mut TcpStream, role: Role, psk: &[u8; 32]) -> io::Resu
         Role::Connector => (c2s, s2c),
         Role::Listener => (s2c, c2s),
     };
-    Ok((Sealer { cipher: tx, counter: 0 }, Opener { cipher: rx, counter: 0 }))
+    Ok((
+        Sealer { cipher: tx, counter: 0 },
+        Opener { cipher: rx, counter: 0, max_frame: HELLO_FRAME_LIMIT },
+    ))
 }
 
 #[cfg(test)]
@@ -140,6 +216,10 @@ mod tests {
         (got, t.join().unwrap())
     }
 
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
     #[test]
     fn matching_keys_talk() {
         let (a, b) = pair("correct horse", "correct horse");
@@ -151,5 +231,47 @@ mod tests {
     fn wrong_key_is_rejected() {
         let (a, b) = pair("correct horse", "battery staple");
         assert!(a.is_err() && b.is_err());
+    }
+
+    #[test]
+    fn hmac_matches_rfc4231() {
+        // Test case 2: short key.
+        let mac = Hmac::new(b"Jefe").mac(&[&b"what do ya want for nothing?"[..]]);
+        assert_eq!(mac.to_vec(), hex("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"));
+        // Test case 6: a key longer than the block size is hashed first.
+        let key = [0xaau8; 131];
+        let mac = Hmac::new(&key).mac(&[&b"Test Using Larger Than Block-Size Key - Hash Key First"[..]]);
+        assert_eq!(mac.to_vec(), hex("60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"));
+    }
+
+    #[test]
+    fn pbkdf2_matches_known_vectors() {
+        assert_eq!(
+            pbkdf2_sha256(b"password", b"salt", 1).to_vec(),
+            hex("120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
+        );
+        assert_eq!(
+            pbkdf2_sha256(b"password", b"salt", 4096).to_vec(),
+            hex("c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a")
+        );
+    }
+
+    #[test]
+    fn psk_is_deterministic_and_key_dependent() {
+        let a = psk_from_passphrase("correct horse battery");
+        assert_eq!(a, psk_from_passphrase("correct horse battery"));
+        assert_ne!(a, psk_from_passphrase("correct horse batterz"));
+    }
+
+    #[test]
+    fn oversized_frame_is_refused_before_allocating() {
+        let mut o = Opener {
+            cipher: ChaCha20Poly1305::new(Key::from_slice(&[7u8; 32])),
+            counter: 0,
+            max_frame: HELLO_FRAME_LIMIT,
+        };
+        let mut input: &[u8] = &(512u32 * 1024 * 1024).to_be_bytes();
+        let err = o.read_frame(&mut input).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
