@@ -92,6 +92,11 @@ The Windows side connects out to the Mac. On the same LAN, use the Mac's hostnam
 When you're remote, run it over **Tailscale** (or your VPN) and connect to the Mac's
 tailnet name. Don't port-forward 47800 to the internet.
 
+The address can be a name, an IPv4 address, or an IPv6 address; add a port with
+`host:port`, and put IPv6 addresses in brackets when you do, e.g.
+`clipbridge connect [fd7a:115c:a1e0::5]:47800`. If a name resolves to several
+addresses (IPv6 and IPv4), each one is tried in turn.
+
 Traffic is encrypted and authenticated with ChaCha20-Poly1305. Your passphrase is
 stretched with PBKDF2-HMAC-SHA256 (600,000 rounds, once at startup), and
 per-session keys are derived from it plus fresh randomness from both sides. A client

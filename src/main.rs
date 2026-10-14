@@ -12,11 +12,10 @@ use clap::{Parser, Subcommand};
 use proto::{Content, Message};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
-use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{Ipv6Addr, Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -43,15 +42,21 @@ pub fn log_line(msg: String) {
         secs % 60
     );
     let _ = io::stderr().write_all(line.as_bytes());
-    if let Some(f) = LOG_FILE.get()
-        && let Ok(mut f) = f.lock() {
-            let _ = f.write_all(line.as_bytes());
-        }
+    if let Some(f) = LOG_FILE.get() {
+        let _ = lock(f).write_all(line.as_bytes());
+    }
 }
 
 #[macro_export]
 macro_rules! log {
     ($($t:tt)*) => { $crate::log_line(format!($($t)*)) };
+}
+
+/// Lock a mutex, carrying on if another thread panicked while holding it: the
+/// state behind these locks stays usable, and one failed clipboard operation
+/// shouldn't take the watcher or the sessions down with it.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 // ---------- CLI ----------
@@ -107,7 +112,8 @@ enum Cmd {
     },
     /// Connect to the listening machine (run this on Windows). Reconnects automatically.
     Connect {
-        /// Host or host:port of the listener, e.g. my-mac or 100.64.1.5:47800
+        /// Host or host:port of the listener, e.g. my-mac, 100.64.1.5:47800 or
+        /// [fd7a:115c::5]:47800 (put IPv6 addresses in brackets when adding a port).
         addr: String,
     },
     /// Print a random passphrase to use as --key.
@@ -122,8 +128,8 @@ struct Shared {
     last_hash: Mutex<Option<[u8; 32]>>,
     /// OS change counter produced by our own write of remote content.
     own_change: Mutex<Option<u64>>,
-    /// Outgoing queue of the active session (newest authenticated session wins).
-    out: Mutex<Option<(u64, Sender<Message>)>>,
+    /// Outbox of the active session (newest authenticated session wins).
+    out: Mutex<Option<(u64, Arc<Outbox>)>>,
     next_id: AtomicU64,
     name: String,
     psk: [u8; 32],
@@ -264,42 +270,49 @@ fn hostname() -> String {
 // ---------- local clipboard watcher ----------
 
 fn watch_clipboard(shared: Arc<Shared>, poll: Duration) {
-    let has_counter = clip::change_count().is_some();
+    let has_counter = clip::HAS_COUNTER;
     let mut last_seen = clip::change_count();
-    // Baseline: whatever is on the clipboard at startup is not "new".
-    if let Some(c) = shared.clip.lock().unwrap().read(true) {
-        *shared.last_hash.lock().unwrap() = Some(c.hash());
+    // Baseline: whatever is on the clipboard at startup is not "new". Copied
+    // files are only noted by path, never loaded, just to compute this.
+    let baseline = lock(&shared.clip).read_baseline();
+    if let Some(c) = baseline {
+        *lock(&shared.last_hash) = Some(c.hash());
     }
     let poll = if has_counter { poll } else { poll.max(Duration::from_secs(1)) };
 
     loop {
         thread::sleep(poll);
-        let now = clip::change_count();
         if has_counter {
-            if now == last_seen {
+            // None: the counter can't be read right now (Windows reports 0 when
+            // access is denied). Don't treat that as a change; check again later.
+            let Some(now) = clip::change_count() else { continue };
+            if last_seen == Some(now) {
                 continue;
             }
-            last_seen = now;
-            if now.is_some() && *shared.own_change.lock().unwrap() == now {
+            last_seen = Some(now);
+            if *lock(&shared.own_change) == Some(now) {
                 continue; // this change was us applying remote content
             }
         }
 
-        let content = shared.clip.lock().unwrap().read(has_counter);
+        let content = lock(&shared.clip).read(has_counter);
         let Some(content) = content else { continue };
         let h = content.hash();
         {
-            let mut last = shared.last_hash.lock().unwrap();
+            let mut last = lock(&shared.last_hash);
             if *last == Some(h) {
                 continue;
             }
             *last = Some(h);
         }
         let desc = content.describe();
-        match shared.out.lock().unwrap().as_ref() {
-            Some((_, tx)) => {
+        let outbox = lock(&shared.out).as_ref().map(|(_, o)| o.clone());
+        match outbox {
+            Some(o) => {
                 log!("→ sending {desc}");
-                let _ = tx.send(Message::Clip(content));
+                if o.put(content) {
+                    log!("(dropped an older clipboard item that hadn't been sent yet)");
+                }
             }
             None => log!("copied {desc} (no peer connected)"),
         }
@@ -308,11 +321,21 @@ fn watch_clipboard(shared: Arc<Shared>, poll: Duration) {
 
 fn apply_remote(shared: &Shared, content: Content) {
     let desc = content.describe();
-    *shared.last_hash.lock().unwrap() = Some(content.hash());
-    let mut clip = shared.clip.lock().unwrap();
+    let h = content.hash();
+    {
+        let mut last = lock(&shared.last_hash);
+        // Already what we last sent or applied (e.g. echoed back by a remote-desktop
+        // app's own text sync): rewriting it could only lose formats, so leave it.
+        if *last == Some(h) {
+            log!("← received {desc} (duplicate, clipboard left as is)");
+            return;
+        }
+        *last = Some(h);
+    }
+    let mut clip = lock(&shared.clip);
     match clip.write(&content) {
         Ok(()) => {
-            *shared.own_change.lock().unwrap() = clip::change_count();
+            *lock(&shared.own_change) = clip::change_count();
             log!("← received {desc}");
         }
         Err(e) => log!("← received {desc} but couldn't put it on the clipboard: {e}"),
@@ -373,8 +396,71 @@ impl Drop for PendingSlot {
     }
 }
 
+/// What a session's writer thread sends next. It holds at most one clipboard
+/// item: a newer copy replaces an older one that hasn't gone out yet, so a slow
+/// link never builds up a backlog of stale (and possibly large) items.
+struct Outbox {
+    state: Mutex<OutboxState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct OutboxState {
+    pending: Option<Content>,
+    closed: bool,
+}
+
+enum Next {
+    Clip(Content),
+    /// Nothing to send for a while: time for a keep-alive ping.
+    Idle,
+    Closed,
+}
+
+impl Outbox {
+    fn new() -> Self {
+        Outbox { state: Mutex::new(OutboxState::default()), ready: Condvar::new() }
+    }
+
+    /// Queue `content` to send. Returns true if it replaced an unsent older item.
+    fn put(&self, content: Content) -> bool {
+        let replaced = lock(&self.state).pending.replace(content).is_some();
+        self.ready.notify_all();
+        replaced
+    }
+
+    fn close(&self) {
+        lock(&self.state).closed = true;
+        self.ready.notify_all();
+    }
+
+    /// Wait up to `timeout` for an item to send.
+    fn next(&self, timeout: Duration) -> Next {
+        let deadline = Instant::now() + timeout;
+        let mut state = lock(&self.state);
+        loop {
+            if state.closed {
+                return Next::Closed;
+            }
+            if let Some(content) = state.pending.take() {
+                return Next::Clip(content);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Next::Idle;
+            }
+            state = match self.ready.wait_timeout(state, deadline - now) {
+                Ok((guard, _)) => guard,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+    }
+}
+
 fn connect_loop(addr: &str, shared: Arc<Shared>) {
-    let addr = if addr.contains(':') && !addr.ends_with(']') {
+    let addr = if addr.parse::<Ipv6Addr>().is_ok() {
+        format!("[{addr}]:{DEFAULT_PORT}") // bare IPv6 address, no port
+    } else if addr.contains(':') && !addr.ends_with(']') {
         addr.to_string()
     } else {
         format!("{addr}:{DEFAULT_PORT}")
@@ -383,11 +469,7 @@ fn connect_loop(addr: &str, shared: Arc<Shared>) {
     loop {
         let started = Instant::now();
         let result = (|| -> io::Result<()> {
-            let sa = addr
-                .to_socket_addrs()?
-                .next()
-                .ok_or_else(|| io::Error::other("could not resolve address"))?;
-            let stream = TcpStream::connect_timeout(&sa, Duration::from_secs(5))?;
+            let stream = connect_any(&addr)?;
             run_session(stream, net::Role::Connector, &shared, None)
         })();
         match result {
@@ -403,6 +485,19 @@ fn connect_loop(addr: &str, shared: Arc<Shared>) {
     }
 }
 
+/// Try every address the name resolves to (IPv6 and IPv4), so one that refuses
+/// or times out doesn't hide one that works.
+fn connect_any(addr: &str) -> io::Result<TcpStream> {
+    let mut last_err = None;
+    for sa in addr.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&sa, Duration::from_secs(5)) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = Some(io::Error::new(e.kind(), format!("{sa}: {e}"))),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::other("could not resolve address")))
+}
+
 /// `pending` is the listener's unauthenticated-connection slot, released once
 /// the peer's Hello has been verified.
 fn run_session(
@@ -416,17 +511,20 @@ fn run_session(
     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
     let (mut sealer, mut opener) = net::handshake(&mut stream, role, &shared.psk)?;
 
-    let (tx, rx) = mpsc::channel::<Message>();
-    tx.send(Message::Hello { name: shared.name.clone() }).ok();
-
+    let outbox = Arc::new(Outbox::new());
     let mut wstream = stream.try_clone()?;
     let max_frame = shared.max_frame;
+    let writer_box = outbox.clone();
+    let mut hello = Some(Message::Hello { name: shared.name.clone() });
     let writer = thread::spawn(move || {
         loop {
-            let msg = match rx.recv_timeout(PING_EVERY) {
-                Ok(m) => m,
-                Err(RecvTimeoutError::Timeout) => Message::Ping,
-                Err(RecvTimeoutError::Disconnected) => break,
+            let msg = match hello.take() {
+                Some(m) => m,
+                None => match writer_box.next(PING_EVERY) {
+                    Next::Clip(c) => Message::Clip(c),
+                    Next::Idle => Message::Ping,
+                    Next::Closed => break,
+                },
             };
             let bytes = match msg.encode() {
                 Ok(b) => b,
@@ -450,22 +548,24 @@ fn run_session(
         let _ = wstream.shutdown(Shutdown::Both);
     });
 
-    // The first frame must be the peer's Hello; only then does this session take
-    // over (so a client with the wrong key can't knock out a good connection).
-    // Until it decrypts, the opener only accepts a tiny frame.
-    let first = Message::decode(&opener.read_frame(&mut stream)?)?;
-    let Message::Hello { name: peer_name } = first else {
-        return Err(proto::bad("peer did not say hello"));
-    };
-    drop(pending.take());
-    opener.set_max_frame(shared.max_frame);
-    stream.set_read_timeout(Some(PEER_TIMEOUT))?;
     let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
-    // Replacing the old sender drops it, which stops the old session's writer.
-    *shared.out.lock().unwrap() = Some((id, tx));
-    log!("connected to \"{peer_name}\" ({peer_addr})");
-
     let result = (|| -> io::Result<()> {
+        // The first frame must be the peer's Hello; only then does this session take
+        // over (so a client with the wrong key can't knock out a good connection).
+        // Until it decrypts, the opener only accepts a tiny frame.
+        let first = Message::decode(&opener.read_frame(&mut stream)?)?;
+        let Message::Hello { name: peer_name } = first else {
+            return Err(proto::bad("peer did not say hello"));
+        };
+        drop(pending.take());
+        opener.set_max_frame(shared.max_frame);
+        stream.set_read_timeout(Some(PEER_TIMEOUT))?;
+        let previous = lock(&shared.out).replace((id, outbox.clone()));
+        if let Some((_, old)) = previous {
+            old.close(); // stops the old session's writer, which ends that session
+        }
+        log!("connected to \"{peer_name}\" ({peer_addr})");
+
         loop {
             let frame = opener.read_frame(&mut stream)?;
             match Message::decode(&frame)? {
@@ -476,11 +576,12 @@ fn run_session(
     })();
 
     {
-        let mut out = shared.out.lock().unwrap();
+        let mut out = lock(&shared.out);
         if matches!(out.as_ref(), Some((cur, _)) if *cur == id) {
             *out = None;
         }
     }
+    outbox.close();
     let _ = stream.shutdown(Shutdown::Both);
     let _ = writer.join();
     match result {

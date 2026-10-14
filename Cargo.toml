@@ -2,6 +2,7 @@
 name = "clipbridge"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 
 [dependencies]
 arboard = { version = "3", features = ["image-data"] }
@@ -21,3 +22,6 @@ windows-sys = { version = "0.61.2", features = ["Win32_System_DataExchange", "Wi
 opt-level = 3
 lto = true
 strip = true
+# A panic anywhere (e.g. in the clipboard watcher thread) ends the process so the
+# supervisor (launchd KeepAlive / the Windows scheduled task) restarts it cleanly.
+panic = "abort"

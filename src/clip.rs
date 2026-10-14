@@ -4,6 +4,9 @@
 //! writes NSImage; on Windows it reads CF_DIBV5/PNG and writes both CF_DIBV5 and
 //! the registered "PNG" format, so Paint, Teams, Outlook and browsers all accept
 //! a paste. File copies map to NSURLs on macOS and CF_HDROP on Windows.
+//!
+//! Text travels with LF line endings and is converted to CRLF when written on
+//! Windows, so the same text hashes the same on both sides.
 
 use crate::log;
 use crate::proto::{human_bytes, Content};
@@ -13,11 +16,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Whether this platform has an OS clipboard change counter (see `change_count`).
+pub const HAS_COUNTER: bool = cfg!(any(windows, target_os = "macos"));
+
 /// Returns a counter the OS bumps on every clipboard change, if the platform has one.
 /// Polling this is nearly free, so we only read actual content when it moves.
 #[cfg(windows)]
 pub fn change_count() -> Option<u64> {
-    Some(unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() } as u64)
+    // 0 means the window station has no clipboard access right now.
+    match unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() } {
+        0 => None,
+        n => Some(n as u64),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -39,6 +49,22 @@ pub fn change_count() -> Option<u64> {
     None
 }
 
+/// Normalize line endings to LF (the form text is hashed and sent in).
+fn to_lf(s: &str) -> String {
+    s.replace("\r\n", "\n")
+}
+
+/// Line endings the local OS expects on the clipboard.
+#[cfg(windows)]
+fn to_native(s: &str) -> String {
+    to_lf(s).replace('\n', "\r\n")
+}
+
+#[cfg(not(windows))]
+fn to_native(s: &str) -> String {
+    to_lf(s)
+}
+
 pub struct Clip {
     cb: Clipboard,
     receive_dir: PathBuf,
@@ -55,18 +81,39 @@ impl Clip {
     /// says something new was copied; without a counter (Linux) we skip
     /// re-reading the same file list on every poll.
     pub fn read(&mut self, fresh: bool) -> Option<Content> {
-        if let Ok(paths) = self.cb.get().file_list()
-            && !paths.is_empty() {
-                if !fresh && paths == self.last_paths {
-                    return None;
-                }
-                self.last_paths = paths.clone();
-                return self.read_files(&paths);
+        if let Some(paths) = self.file_list() {
+            if !fresh && paths == self.last_paths {
+                return None;
             }
+            self.last_paths = paths.clone();
+            return self.read_files(&paths);
+        }
         self.last_paths.clear();
+        self.read_text_or_image()
+    }
+
+    /// Like `read`, for the startup baseline: a copied file list is only
+    /// remembered by path, never loaded, so it costs nothing however large it is.
+    pub fn read_baseline(&mut self) -> Option<Content> {
+        if let Some(paths) = self.file_list() {
+            self.last_paths = paths;
+            return None;
+        }
+        self.last_paths.clear();
+        self.read_text_or_image()
+    }
+
+    fn file_list(&mut self) -> Option<Vec<PathBuf>> {
+        match self.cb.get().file_list() {
+            Ok(paths) if !paths.is_empty() => Some(paths),
+            _ => None,
+        }
+    }
+
+    fn read_text_or_image(&mut self) -> Option<Content> {
         if let Ok(t) = self.cb.get_text()
             && !t.is_empty() {
-                return Some(Content::Text(t));
+                return Some(Content::Text(to_lf(&t)));
             }
         if let Ok(img) = self.cb.get_image()
             && img.width > 0 && img.height > 0 {
@@ -118,7 +165,7 @@ impl Clip {
 
     pub fn write(&mut self, content: &Content) -> Result<(), String> {
         match content {
-            Content::Text(t) => self.cb.set_text(t.as_str()).map_err(|e| e.to_string()),
+            Content::Text(t) => self.cb.set_text(to_native(t)).map_err(|e| e.to_string()),
             Content::Image { width, height, rgba } => self
                 .cb
                 .set_image(ImageData {
