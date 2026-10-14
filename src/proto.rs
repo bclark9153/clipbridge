@@ -10,6 +10,8 @@ use std::io::{self, Cursor, Read};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Content {
     Text(String),
+    /// Formatted text: HTML plus the plain-text version for apps that can't take HTML.
+    Rich { text: String, html: String },
     /// Raw RGBA8 pixels, normalized so macOS TIFF and Windows DIB both map here.
     Image { width: u32, height: u32, rgba: Vec<u8> },
     /// Copied files: (file name, contents).
@@ -22,9 +24,12 @@ impl Content {
     pub fn hash(&self) -> [u8; 32] {
         let mut h = Sha256::new();
         match self {
-            Content::Text(t) => {
-                h.update(b"t");
-                h.update(t.as_bytes());
+            Content::Text(t) => return text_hash(t),
+            Content::Rich { text, html } => {
+                h.update(b"r");
+                h.update((text.len() as u64).to_be_bytes());
+                h.update(text.as_bytes());
+                h.update(html.as_bytes());
             }
             Content::Image { width, height, rgba } => {
                 h.update(b"i");
@@ -45,9 +50,27 @@ impl Content {
         h.finalize().into()
     }
 
+    /// For rich text, the hash its plain-text version would have on its own.
+    /// Lets the sync recognise a text-only echo of formatted content.
+    pub fn plain_hash(&self) -> Option<[u8; 32]> {
+        match self {
+            Content::Rich { text, .. } => Some(text_hash(text)),
+            _ => None,
+        }
+    }
+
+    /// Drop formatting: rich text becomes its plain-text version.
+    pub fn into_plain(self) -> Content {
+        match self {
+            Content::Rich { text, .. } => Content::Text(text),
+            other => other,
+        }
+    }
+
     pub fn describe(&self) -> String {
         match self {
             Content::Text(t) => format!("text ({} chars)", t.chars().count()),
+            Content::Rich { text, .. } => format!("rich text ({} chars)", text.chars().count()),
             Content::Image { width, height, .. } => format!("image {width}x{height}"),
             Content::Files(f) => {
                 let total: usize = f.iter().map(|(_, d)| d.len()).sum();
@@ -55,6 +78,13 @@ impl Content {
             }
         }
     }
+}
+
+fn text_hash(t: &str) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"t");
+    h.update(t.as_bytes());
+    h.finalize().into()
 }
 
 #[derive(Debug, PartialEq)]
@@ -69,6 +99,7 @@ const K_PING: u8 = 1;
 const K_TEXT: u8 = 2;
 const K_IMAGE_PNG: u8 = 3;
 const K_FILES: u8 = 4;
+const K_RICH: u8 = 5;
 
 impl Message {
     pub fn encode(&self) -> io::Result<Vec<u8>> {
@@ -82,6 +113,15 @@ impl Message {
             Message::Clip(Content::Text(t)) => {
                 out.push(K_TEXT);
                 out.extend_from_slice(t.as_bytes());
+            }
+            Message::Clip(Content::Rich { text, html }) => {
+                // u32 text length, text, then the HTML up to the end.
+                out.push(K_RICH);
+                let t = text.as_bytes();
+                let tlen = u32::try_from(t.len()).map_err(|_| bad("text too long"))?;
+                out.extend_from_slice(&tlen.to_be_bytes());
+                out.extend_from_slice(t);
+                out.extend_from_slice(html.as_bytes());
             }
             Message::Clip(Content::Image { width, height, rgba }) => {
                 // PNG on the wire: lossless and typically 5-20x smaller than raw RGBA.
@@ -117,6 +157,13 @@ impl Message {
             K_HELLO => Message::Hello { name: utf8(body)? },
             K_PING => Message::Ping,
             K_TEXT => Message::Clip(Content::Text(utf8(body)?)),
+            K_RICH => {
+                let mut c = Cursor::new(body);
+                let tlen = read_u32(&mut c)? as usize;
+                let text = utf8(&take(&mut c, tlen)?)?;
+                let html = utf8(&body[c.position() as usize..])?;
+                Message::Clip(Content::Rich { text, html })
+            }
             K_IMAGE_PNG => {
                 let img = image::load_from_memory_with_format(body, image::ImageFormat::Png)
                     .map_err(|e| bad(&format!("png decode: {e}")))?
@@ -188,6 +235,11 @@ mod tests {
             Message::Hello { name: "mac-studio".into() },
             Message::Ping,
             Message::Clip(Content::Text("héllo 👋\r\nworld".into())),
+            Message::Clip(Content::Rich {
+                text: "bold 👋\nnext".into(),
+                html: "<b>bold</b> 👋<br>next".into(),
+            }),
+            Message::Clip(Content::Rich { text: String::new(), html: "<p></p>".into() }),
             Message::Clip(Content::Image { width: 7, height: 5, rgba }),
             Message::Clip(Content::Files(vec![
                 ("a.txt".into(), b"abc".to_vec()),
@@ -198,6 +250,27 @@ mod tests {
             let enc = m.encode().unwrap();
             assert_eq!(Message::decode(&enc).unwrap(), m);
         }
+    }
+
+    #[test]
+    fn rich_hash_covers_text_and_html() {
+        let rich = |t: &str, h: &str| Content::Rich { text: t.into(), html: h.into() };
+        let a = rich("hi", "<b>hi</b>");
+        assert_ne!(a.hash(), rich("hi", "<i>hi</i>").hash());
+        assert_ne!(a.hash(), rich("ho", "<b>hi</b>").hash());
+        // The text/html boundary is part of the hash.
+        assert_ne!(rich("ab", "c").hash(), rich("a", "bc").hash());
+        assert_ne!(a.hash(), Content::Text("hi".into()).hash());
+        assert_eq!(a.plain_hash(), Some(Content::Text("hi".into()).hash()));
+        assert_eq!(a.into_plain(), Content::Text("hi".into()));
+    }
+
+    #[test]
+    fn rejects_truncated_rich() {
+        let m = Message::Clip(Content::Rich { text: "hello".into(), html: "<p>hello</p>".into() });
+        let enc = m.encode().unwrap();
+        // Cut inside the text: the declared length no longer fits.
+        assert!(Message::decode(&enc[..1 + 4 + 3]).is_err());
     }
 
     #[test]

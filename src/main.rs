@@ -1,4 +1,4 @@
-//! ClipBridge — two-way clipboard sync (text, screenshots/images, files) between
+//! ClipBridge — two-way clipboard sync (text, rich text, screenshots/images, files) between
 //! two machines, designed to run alongside a remote-desktop app like Jump Desktop.
 //!
 //!   Mac:      clipbridge listen  --key-file ~/.config/clipbridge/key
@@ -62,7 +62,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 // ---------- CLI ----------
 
 #[derive(Parser)]
-#[command(name = "clipbridge", version, about = "Two-way clipboard sync: text, screenshots and files")]
+#[command(name = "clipbridge", version, about = "Two-way clipboard sync: text, rich text, screenshots and files")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -92,6 +92,10 @@ struct Cli {
     /// Largest total size of copied files to sync, in MB.
     #[arg(long, default_value_t = 200, global = true)]
     max_mb: usize,
+
+    /// Sync plain text only: don't send or apply HTML formatting.
+    #[arg(long, global = true)]
+    plain_text: bool,
 
     /// Clipboard check interval in milliseconds.
     #[arg(long, default_value_t = 250, global = true)]
@@ -124,8 +128,8 @@ enum Cmd {
 
 struct Shared {
     clip: Mutex<clip::Clip>,
-    /// Hash of the content most recently sent or applied; stops echo loops.
-    last_hash: Mutex<Option<[u8; 32]>>,
+    /// The content most recently sent or applied; stops echo loops.
+    last: Mutex<Seen>,
     /// OS change counter produced by our own write of remote content.
     own_change: Mutex<Option<u64>>,
     /// Outbox of the active session (newest authenticated session wins).
@@ -135,6 +139,29 @@ struct Shared {
     psk: [u8; 32],
     /// Largest frame sent or accepted once the peer has authenticated.
     max_frame: usize,
+    /// --plain-text: formatting from the peer is dropped too.
+    plain_text: bool,
+}
+
+/// Hashes of the content most recently sent or applied.
+#[derive(Default)]
+struct Seen {
+    hash: Option<[u8; 32]>,
+    /// For rich text, the hash of its plain-text version. A remote-desktop app
+    /// that syncs text by itself (Jump Desktop does) can put that text on the
+    /// clipboard, or echo it back, and it must not replace the formatted original.
+    plain: Option<[u8; 32]>,
+}
+
+impl Seen {
+    fn is_duplicate(&self, h: &[u8; 32]) -> bool {
+        self.hash.as_ref() == Some(h) || self.plain.as_ref() == Some(h)
+    }
+
+    fn remember(&mut self, content: &Content, h: [u8; 32]) {
+        self.hash = Some(h);
+        self.plain = content.plain_hash();
+    }
 }
 
 fn main() {
@@ -174,7 +201,7 @@ fn main() {
     }
 
     let receive_dir = cli.receive_dir.clone().unwrap_or_else(default_receive_dir);
-    let clip = match clip::Clip::new(receive_dir.clone(), cli.max_mb.saturating_mul(MB)) {
+    let clip = match clip::Clip::new(receive_dir.clone(), cli.max_mb.saturating_mul(MB), !cli.plain_text) {
         Ok(c) => c,
         Err(e) => {
             log!("cannot open the clipboard: {e}");
@@ -184,7 +211,7 @@ fn main() {
 
     let shared = Arc::new(Shared {
         clip: Mutex::new(clip),
-        last_hash: Mutex::new(None),
+        last: Mutex::new(Seen::default()),
         own_change: Mutex::new(None),
         out: Mutex::new(None),
         next_id: AtomicU64::new(1),
@@ -192,6 +219,7 @@ fn main() {
         name: cli.name.clone().unwrap_or_else(hostname).chars().take(200).collect(),
         psk: net::psk_from_passphrase(&key),
         max_frame: frame_limit(cli.max_mb),
+        plain_text: cli.plain_text,
     });
 
     log!("ClipBridge {} as \"{}\"; received files go to {}", env!("CARGO_PKG_VERSION"), shared.name, receive_dir.display());
@@ -276,7 +304,8 @@ fn watch_clipboard(shared: Arc<Shared>, poll: Duration) {
     // files are only noted by path, never loaded, just to compute this.
     let baseline = lock(&shared.clip).read_baseline();
     if let Some(c) = baseline {
-        *lock(&shared.last_hash) = Some(c.hash());
+        let h = c.hash();
+        lock(&shared.last).remember(&c, h);
     }
     let poll = if has_counter { poll } else { poll.max(Duration::from_secs(1)) };
 
@@ -299,11 +328,11 @@ fn watch_clipboard(shared: Arc<Shared>, poll: Duration) {
         let Some(content) = content else { continue };
         let h = content.hash();
         {
-            let mut last = lock(&shared.last_hash);
-            if *last == Some(h) {
+            let mut last = lock(&shared.last);
+            if last.is_duplicate(&h) {
                 continue;
             }
-            *last = Some(h);
+            last.remember(&content, h);
         }
         let desc = content.describe();
         let outbox = lock(&shared.out).as_ref().map(|(_, o)| o.clone());
@@ -320,17 +349,19 @@ fn watch_clipboard(shared: Arc<Shared>, poll: Duration) {
 }
 
 fn apply_remote(shared: &Shared, content: Content) {
+    let content = if shared.plain_text { content.into_plain() } else { content };
     let desc = content.describe();
     let h = content.hash();
     {
-        let mut last = lock(&shared.last_hash);
-        // Already what we last sent or applied (e.g. echoed back by a remote-desktop
-        // app's own text sync): rewriting it could only lose formats, so leave it.
-        if *last == Some(h) {
+        let mut last = lock(&shared.last);
+        // Already what we last sent or applied (or the plain text of it, e.g.
+        // echoed back by a remote-desktop app's own text sync): rewriting it
+        // could only lose formats, so leave the clipboard alone.
+        if last.is_duplicate(&h) {
             log!("← received {desc} (duplicate, clipboard left as is)");
             return;
         }
-        *last = Some(h);
+        last.remember(&content, h);
     }
     let mut clip = lock(&shared.clip);
     match clip.write(&content) {

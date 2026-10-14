@@ -7,6 +7,7 @@ directions:
 | Copy this… | …paste it on the other side as |
 |---|---|
 | Text | Text |
+| Formatted text (from a browser, Word, Outlook, Pages, VS Code…) | Formatted text: bold, links, lists and tables paste as HTML, with a plain-text version for apps that only take text |
 | A screenshot (`⌃⇧⌘4` on Mac, `Win+Shift+S` on Windows) or any copied image | A real image: paste into Slack, Teams, Outlook, Paint, Preview, browsers |
 | Files from Finder / Explorer | Real files: paste into Explorer / Finder (saved under `~/ClipBridge Received`) |
 
@@ -115,16 +116,19 @@ e.g. `clipbridge listen 100.x.y.z:47800`.
 --receive-dir <dir>   where received files go (default: ~/ClipBridge Received)
 --max-mb <n>          max total size of copied files to sync (default 200)
 --poll-ms <n>         clipboard check interval (default 250)
+--plain-text          sync plain text only; don't carry HTML formatting over
 --background          Windows: detach from the console window
 ```
 
-## Notes and limits (v0.1)
+## Notes and limits (v0.2)
 
-- **Only one item type syncs per copy, chosen in this order: files, then text, then image.**
-  So copying a spreadsheet range sends its text, not a picture of it.
+- **Only one item type syncs per copy, chosen in this order: files, then text (with its
+  HTML formatting, if the app provided any), then image.** So copying a spreadsheet range
+  sends its text and HTML table, not a picture of it.
+- **Formatting travels as HTML.** RTF-only content (some older apps) arrives as plain
+  text. Use `--plain-text` if you'd rather never carry formatting over.
 - **Folders are skipped.** Only files are copied. Zip a folder first if you need it.
 - **Received files pile up.** They accumulate in `ClipBridge Received`; clear it out occasionally.
-- **Rich text and HTML formatting are not carried over yet.** Only plain text syncs.
 - **Both machines must run the same protocol version.** v0.2 changed the key derivation,
   so a v0.1 peer is refused with "peer is not ClipBridge v2".
 - **It's a 1:1 bridge.** If a second machine connects with the right key, it replaces
@@ -135,6 +139,6 @@ e.g. `clipbridge listen 100.x.y.z:47800`.
 ```
 src/main.rs   CLI, clipboard watcher, sessions, reconnect
 src/clip.rs   native clipboard read/write + OS change counters
-src/proto.rs  message format (text / PNG image / files) and content hashing
+src/proto.rs  message format (text / rich text / PNG image / files) and content hashing
 src/net.rs    handshake, key derivation, encrypted framing
 ```

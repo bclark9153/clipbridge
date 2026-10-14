@@ -69,12 +69,14 @@ pub struct Clip {
     cb: Clipboard,
     receive_dir: PathBuf,
     max_file_bytes: usize,
+    /// Read HTML alongside text (off with --plain-text).
+    rich: bool,
     last_paths: Vec<PathBuf>,
 }
 
 impl Clip {
-    pub fn new(receive_dir: PathBuf, max_file_bytes: usize) -> Result<Self, arboard::Error> {
-        Ok(Self { cb: Clipboard::new()?, receive_dir, max_file_bytes, last_paths: Vec::new() })
+    pub fn new(receive_dir: PathBuf, max_file_bytes: usize, rich: bool) -> Result<Self, arboard::Error> {
+        Ok(Self { cb: Clipboard::new()?, receive_dir, max_file_bytes, rich, last_paths: Vec::new() })
     }
 
     /// Read the current clipboard. `fresh` is true when the OS change counter
@@ -110,10 +112,18 @@ impl Clip {
         }
     }
 
+    /// Text (with its HTML version, if the copying app provided one), else an image.
     fn read_text_or_image(&mut self) -> Option<Content> {
         if let Ok(t) = self.cb.get_text()
             && !t.is_empty() {
-                return Some(Content::Text(to_lf(&t)));
+                let text = to_lf(&t);
+                if self.rich
+                    && let Ok(html) = self.cb.get().html()
+                    && !html.is_empty()
+                    && html != text {
+                        return Some(Content::Rich { text, html });
+                    }
+                return Some(Content::Text(text));
             }
         if let Ok(img) = self.cb.get_image()
             && img.width > 0 && img.height > 0 {
@@ -166,6 +176,17 @@ impl Clip {
     pub fn write(&mut self, content: &Content) -> Result<(), String> {
         match content {
             Content::Text(t) => self.cb.set_text(to_native(t)).map_err(|e| e.to_string()),
+            Content::Rich { text, html } => {
+                // HTML plus the plain-text version for apps that only take text.
+                // arboard adds the CF_HTML header on Windows and uses public.html on macOS.
+                let alt = to_native(text);
+                let result = self.cb.set().html(html.as_str(), Some(alt.as_str()));
+                if let Err(e) = result {
+                    log!("couldn't put formatted text on the clipboard ({e}); using plain text");
+                    return self.cb.set_text(alt).map_err(|e| e.to_string());
+                }
+                Ok(())
+            }
             Content::Image { width, height, rgba } => self
                 .cb
                 .set_image(ImageData {
