@@ -67,6 +67,22 @@ impl Content {
         }
     }
 
+    /// True for text that is nothing but `file://` links, one per line. That is
+    /// how a remote-desktop app's own clipboard sharing (Jump Desktop does this)
+    /// passes on a file copy, since it can only carry text. The links point at
+    /// the other machine's disk, so they are useless here and must neither be
+    /// echoed back nor allowed to replace the real files.
+    pub fn is_file_url_list(&self) -> bool {
+        let text = match self {
+            Content::Text(t) => t,
+            Content::Rich { text, .. } => text,
+            _ => return false,
+        };
+        let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+        let Some(first) = lines.next() else { return false };
+        is_file_url(first) && lines.all(is_file_url)
+    }
+
     pub fn describe(&self) -> String {
         match self {
             Content::Text(t) => format!("text ({} chars)", t.chars().count()),
@@ -82,6 +98,10 @@ impl Content {
             }
         }
     }
+}
+
+fn is_file_url(line: &str) -> bool {
+    line.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("file://"))
 }
 
 fn text_hash(t: &str) -> [u8; 32] {
@@ -267,6 +287,19 @@ mod tests {
         assert_ne!(a.hash(), Content::Text("hi".into()).hash());
         assert_eq!(a.plain_hash(), Some(Content::Text("hi".into()).hash()));
         assert_eq!(a.into_plain(), Content::Text("hi".into()));
+    }
+
+    #[test]
+    fn file_url_lists_are_recognised() {
+        let t = |s: &str| Content::Text(s.into());
+        assert!(t("file:///C:/Users/Brian/Downloads/deck.pptx").is_file_url_list());
+        assert!(t("file:///C:/a.pptx\r\nFILE:///C:/b.pdf\r\n").is_file_url_list());
+        assert!(Content::Rich { text: "file:///tmp/x".into(), html: "<a>x</a>".into() }.is_file_url_list());
+        assert!(!t("see file:///C:/a.pptx for details").is_file_url_list());
+        assert!(!t("file:///C:/a.pptx\nand a note").is_file_url_list());
+        assert!(!t("").is_file_url_list());
+        assert!(!t("héllo").is_file_url_list());
+        assert!(!Content::Files(vec![("file://x".into(), vec![])]).is_file_url_list());
     }
 
     #[test]

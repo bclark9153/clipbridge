@@ -573,6 +573,10 @@ fn watch_clipboard(shared: Arc<Shared>, poll: Duration) {
 
         let content = lock(&shared.clip).read(has_counter);
         let Some(content) = content else { continue };
+        if content.is_file_url_list() {
+            log!("ignoring a list of file:// links on the clipboard (another tool's text version of a file copy)");
+            continue;
+        }
         let h = content.hash();
         {
             let mut last = lock(&shared.last);
@@ -597,6 +601,10 @@ fn watch_clipboard(shared: Arc<Shared>, poll: Duration) {
 
 fn apply_remote(shared: &Shared, content: Content) {
     let content = if shared.plain_text { content.into_plain() } else { content };
+    if content.is_file_url_list() {
+        log!("← ignored a list of file:// links (they point at the other machine's disk)");
+        return;
+    }
     let desc = content.describe();
     let h = content.hash();
     {

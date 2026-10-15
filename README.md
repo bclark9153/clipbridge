@@ -51,6 +51,12 @@ sends them as PNG, and writes them back natively. On Windows that means writing 
    Both sides log `paired` and then `connected to "<other machine>"`. Copy something
    and you'll see `→ sending …` on one side and `← received …` on the other.
 
+4. **Turn off clipboard sharing in Jump Desktop** (or whichever remote-desktop app you
+   use) for this connection. ClipBridge replaces it, and the two fight otherwise: Jump
+   can only carry text, so it turns a file copy into a list of `file:///C:/...` links
+   that can arrive before, or on top of, the real files. ClipBridge ignores such lists,
+   but the paste still gets whichever one landed last.
+
 That's it. The key agreed during pairing is saved on both machines and used from then on:
 
 - Mac: `~/.config/clipbridge/key`
