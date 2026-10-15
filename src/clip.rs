@@ -14,7 +14,11 @@ use arboard::{Clipboard, ImageData};
 use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// How long after a file copy or receive the files may be put back on the
+/// clipboard if another sync tool overwrites them with links.
+const RESTORE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Whether this platform has an OS clipboard change counter (see `change_count`).
 pub const HAS_COUNTER: bool = cfg!(any(windows, target_os = "macos"));
@@ -71,12 +75,26 @@ pub struct Clip {
     max_file_bytes: usize,
     /// Read HTML alongside text (off with --plain-text).
     rich: bool,
+    /// The files most recently copied here or received from the peer.
     last_paths: Vec<PathBuf>,
+    paths_at: Option<Instant>,
+    paths_received: bool,
+    /// Times `restore_files` has put `last_paths` back since they were noted.
+    restores: u32,
 }
 
 impl Clip {
     pub fn new(receive_dir: PathBuf, max_file_bytes: usize, rich: bool) -> Result<Self, arboard::Error> {
-        Ok(Self { cb: Clipboard::new()?, receive_dir, max_file_bytes, rich, last_paths: Vec::new() })
+        Ok(Self {
+            cb: Clipboard::new()?,
+            receive_dir,
+            max_file_bytes,
+            rich,
+            last_paths: Vec::new(),
+            paths_at: None,
+            paths_received: false,
+            restores: 0,
+        })
     }
 
     /// Read the current clipboard. `fresh` is true when the OS change counter
@@ -87,10 +105,11 @@ impl Clip {
             if !fresh && paths == self.last_paths {
                 return None;
             }
-            self.last_paths = paths.clone();
+            self.note_paths(paths.clone(), false);
             return self.read_files(&paths);
         }
-        self.last_paths.clear();
+        // `last_paths` is kept: if this text turns out to be another tool's
+        // link list for those files, `restore_files` puts them back.
         self.read_text_or_image()
     }
 
@@ -98,10 +117,11 @@ impl Clip {
     /// remembered by path, never loaded, so it costs nothing however large it is.
     pub fn read_baseline(&mut self) -> Option<Content> {
         if let Some(paths) = self.file_list() {
-            self.last_paths = paths;
+            self.note_paths(paths, false);
             return None;
         }
-        self.last_paths.clear();
+        // `last_paths` is kept: if this text turns out to be another tool's
+        // link list for those files, `restore_files` puts them back.
         self.read_text_or_image()
     }
 
@@ -109,6 +129,40 @@ impl Clip {
         match self.cb.get().file_list() {
             Ok(paths) if !paths.is_empty() => Some(paths),
             _ => None,
+        }
+    }
+
+    fn note_paths(&mut self, paths: Vec<PathBuf>, received: bool) {
+        self.last_paths = paths;
+        self.paths_at = Some(Instant::now());
+        self.paths_received = received;
+        self.restores = 0;
+    }
+
+    /// Put the last copied or received files back on the clipboard after another
+    /// sync tool (Jump Desktop's clipboard sharing) replaced them with a text
+    /// list of links. The receiving side may do this twice and the copying side
+    /// once, within a minute of the copy: that is enough for the machine where
+    /// the paste happens to end up with the files, without the two tools
+    /// ping-ponging forever. Returns how many files were put back.
+    pub fn restore_files(&mut self) -> Option<usize> {
+        let noted_at = self.paths_at?;
+        let limit = if self.paths_received { 2 } else { 1 };
+        if self.last_paths.is_empty()
+            || noted_at.elapsed() > RESTORE_WINDOW
+            || self.restores >= limit
+            || !self.last_paths.iter().all(|p| p.exists())
+        {
+            return None;
+        }
+        self.restores += 1;
+        let _ = self.cb.clear(); // drop the link text rather than sit next to it
+        match self.cb.set().file_list(&self.last_paths) {
+            Ok(()) => Some(self.last_paths.len()),
+            Err(e) => {
+                log!("couldn't put the copied files back on the clipboard: {e}");
+                None
+            }
         }
     }
 
@@ -208,7 +262,10 @@ impl Clip {
                 .map_err(|e| e.to_string()),
             Content::Files(files) => {
                 let paths = self.save_files(files).map_err(|e| e.to_string())?;
-                self.last_paths = paths.clone();
+                self.note_paths(paths.clone(), true);
+                // On Windows arboard adds CF_HDROP next to whatever is already
+                // there; clear first so text apps don't paste the old text.
+                let _ = self.cb.clear();
                 self.cb.set().file_list(&paths).map_err(|e| e.to_string())
             }
         }

@@ -574,7 +574,21 @@ fn watch_clipboard(shared: Arc<Shared>, poll: Duration) {
         let content = lock(&shared.clip).read(has_counter);
         let Some(content) = content else { continue };
         if content.is_file_url_list() {
-            log!("ignoring a list of file:// links on the clipboard (another tool's text version of a file copy)");
+            // Another tool's text version of a file copy (Jump Desktop's clipboard
+            // sharing does this). Put the real files back if we have them, so a
+            // paste still gets files whichever tool wrote last.
+            let restored = {
+                let mut clip = lock(&shared.clip);
+                let n = clip.restore_files();
+                if n.is_some() {
+                    *lock(&shared.own_change) = clip::change_count();
+                }
+                n
+            };
+            match restored {
+                Some(n) => log!("another tool replaced the copied files with file:// links; put the {n} file(s) back"),
+                None => log!("ignoring a list of file:// links on the clipboard (another tool's text version of a file copy)"),
+            }
             continue;
         }
         let h = content.hash();
