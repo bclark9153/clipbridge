@@ -7,6 +7,7 @@ directions:
 | Copy this… | …paste it on the other side as |
 |---|---|
 | Text | Text |
+| Formatted text (from a browser, Word, Outlook, Pages, VS Code…) | Formatted text: bold, links, lists and tables paste as HTML, with a plain-text version for apps that only take text |
 | A screenshot (`⌃⇧⌘4` on Mac, `Win+Shift+S` on Windows) or any copied image | A real image: paste into Slack, Teams, Outlook, Paint, Preview, browsers |
 | Files from Finder / Explorer | Real files: paste into Explorer / Finder (saved under `~/ClipBridge Received`) |
 
@@ -25,87 +26,155 @@ sends them as PNG, and writes them back natively. On Windows that means writing 
 
 ## Quick start
 
-1. **Build** (once per machine, needs [Rust](https://rustup.rs)):
+1. **Install it.** On each Mac, in Terminal:
    ```
-   cargo build --release
+   curl -fsSL https://github.com/bclark9153/clipbridge/releases/latest/download/install.sh | sh
    ```
-   Binary: `target/release/clipbridge` (Mac) or `target\release\clipbridge.exe` (Windows).
-   Or push this folder to a GitHub repo and download both builds from the **Actions** tab.
+   It picks the Apple Silicon or Intel build from the latest release and installs it to
+   `/usr/local/bin` (run it again to upgrade). On Windows, download
+   `clipbridge-windows-x86_64.exe` from the
+   [latest release](https://github.com/bclark9153/clipbridge/releases/latest) and rename
+   it to `clipbridge.exe`. Every push also builds all three in the **Actions** tab, or
+   build it yourself with [Rust](https://rustup.rs): `cargo build --release`.
 
-2. **Make a shared key** on either machine:
+2. **On the Mac**, run it. It listens on TCP 47800 and, since it has no key yet, shows a
+   pairing code:
    ```
-   clipbridge genkey
+   clipbridge listen
    ```
-
-3. **On the Mac** (listens on TCP 47800):
    ```
-   clipbridge listen --key <key>
+   Pairing code for "Brians-MBP":   483 912
    ```
    Allow incoming connections if the macOS firewall asks. If macOS asks whether
    ClipBridge may access pasted content from other apps, choose **Allow**.
 
-4. **On Windows:**
+3. **On Windows**, connect to the Mac and type the code when asked:
    ```
-   clipbridge connect <mac-hostname-or-ip> --key <key>
+   clipbridge connect brians-mbp.local
    ```
-   Both windows should log `connected to "<other machine>"`. Copy something and you'll
-   see `→ sending …` on one side and `← received …` on the other.
+   The Mac's name is in System Settings → General → Sharing, under "Local hostname";
+   on the same network it is reachable as that name plus `.local`.
+
+   Both sides log `paired` and then `connected to "<other machine>"`. Copy something
+   and you'll see `→ sending …` on one side and `← received …` on the other.
+
+4. **If you can, turn off clipboard sharing in Jump Desktop** (or whichever remote-desktop
+   app you use) for this connection; ClipBridge replaces it. Some Jump clients have no
+   such setting, so ClipBridge also copes with it: Jump can only carry text and turns a
+   file copy into a list of `file:///C:/...` links, which can land on top of the real
+   files. ClipBridge never syncs such lists, and when one overwrites files it just copied
+   or received, it puts the files back, so a paste gets real files.
+
+That's it. The key agreed during pairing is saved on both machines and used from then on:
+
+- Mac: `~/.config/clipbridge/key`
+- Windows: one file per Mac in `%LOCALAPPDATA%\ClipBridge\keys\`
+
+All of them are readable only by your account. To pair with a different machine later,
+run `clipbridge listen --pair` on the Mac and `clipbridge pair <mac> --force` on
+Windows: a fresh code replaces the stored key.
+
+## More than one Mac
+
+Windows can sync with several Macs at once. List them all on `connect`:
+```
+clipbridge connect 192.168.1.20 192.168.1.31
+```
+Each Mac runs `clipbridge listen` as usual and is paired on its own: Windows asks for
+the code of every Mac it has no key for yet. Every copy on Windows goes to all the
+Macs, and a copy on one Mac goes to Windows and on to the other Macs, so all the
+clipboards stay the same. Windows is the hub: if it isn't running, the Macs don't
+sync with each other.
 
 ## Run automatically
 
-**Mac:** copy `clipbridge` to `/usr/local/bin`, put your key in
-`install/macos/com.simplebit.clipbridge.plist`, then:
+**Mac:** install with the `curl` command above, pair once, then:
 ```
 cp install/macos/com.simplebit.clipbridge.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.simplebit.clipbridge.plist
 ```
-The log is at `/tmp/clipbridge.log`.
+The log is at `/tmp/clipbridge.log`. While the agent runs, you can't pair in a terminal
+at the same time (the port is taken); pair first, or stop the agent with
+`launchctl bootout gui/$(id -u)/com.simplebit.clipbridge`.
 
-**Windows:** put `clipbridge.exe` next to the script, then in PowerShell:
+**Windows:** put `clipbridge.exe` next to the script, make sure any Mac you haven't
+paired yet is showing a pairing code, then in PowerShell:
 ```
-.\install\windows\install-startup.ps1 -MacHost my-mac -Key <key>
+.\install\windows\install-startup.ps1 -MacHost brians-mbp.local
 ```
-This registers a logon task that runs hidden and keeps reconnecting. A console window
-may flash briefly at logon. The log is at `%LOCALAPPDATA%\ClipBridge\clipbridge.log`.
+For several Macs, separate them with commas: `-MacHost 192.168.1.20, 192.168.1.31`.
+It pairs each Mac that needs it (you type the codes), then registers a logon task that runs hidden and
+keeps reconnecting. A console window may flash briefly at logon. The log is at
+`%LOCALAPPDATA%\ClipBridge\clipbridge.log`.
 
 ## Networking
 
-The Windows side connects out to the Mac. On the same LAN, use the Mac's hostname or IP.
-When you're remote, run it over **Tailscale** (or your VPN) and connect to the Mac's
-tailnet name. Don't port-forward 47800 to the internet.
+The Windows side connects out to the Mac. On the same LAN, use the Mac's `.local` name
+or its IP. When you're remote, run it over **Tailscale** (or your VPN) and connect to the
+Mac's tailnet name. Don't port-forward 47800 to the internet.
 
-Traffic is encrypted and authenticated with ChaCha20-Poly1305. Per-session keys are
-derived from your passphrase plus fresh randomness from both sides. A client with the
-wrong key is rejected and can't disrupt the existing connection. To limit exposure,
-bind the Mac to a single interface, e.g. `clipbridge listen 100.x.y.z:47800`.
+The address can be a name, an IPv4 address, or an IPv6 address; add a port with
+`host:port`, and put IPv6 addresses in brackets when you do, e.g.
+`clipbridge connect [fd7a:115c:a1e0::5]:47800`. If a name resolves to several
+addresses (IPv6 and IPv4), each one is tried in turn.
+
+## Security
+
+Pairing runs SPAKE2, a password-authenticated key exchange, with the six-digit code as
+the password. The code never crosses the network and can't be brute-forced from a
+recording: a wrong guess only shows up as a failed connection, and the Mac then shows a
+new code, so an attacker gets one guess per code. Each pairing produces a fresh 256-bit
+key that both sides store.
+
+Sessions are encrypted and authenticated with ChaCha20-Poly1305. Per-session keys are
+derived from the stored key (stretched with PBKDF2-HMAC-SHA256) plus fresh randomness
+from both sides. A client with the wrong key is rejected and can't disrupt the existing
+connection. Until a peer has proved it knows the key, the listener only accepts a tiny
+first message and at most 8 such connections at once. To limit exposure, bind the Mac to
+a single interface, e.g. `clipbridge listen 100.x.y.z:47800`.
+
+If you'd rather manage the key yourself, `clipbridge genkey` prints a passphrase to use
+with `--key-file <path>` or `--key <secret>` on both machines; then no pairing happens.
 
 ## Options
 
 ```
---key <secret>        shared passphrase (or set CLIPBRIDGE_KEY)
+clipbridge listen [bind] [--pair]
+clipbridge connect <host>... [--code 483912] [--pair]
+clipbridge pair <host>... [--code 483912] [--force]   pair the unpaired hosts and exit
+
+--key-file <path>     where the key is kept (default: the paths above; or CLIPBRIDGE_KEY_FILE)
+--key <secret>        use this passphrase instead of a stored key (or CLIPBRIDGE_KEY)
 --name <name>         name shown to the other side (default: hostname)
 --log <file>          also append the log to a file
 --receive-dir <dir>   where received files go (default: ~/ClipBridge Received)
 --max-mb <n>          max total size of copied files to sync (default 200)
 --poll-ms <n>         clipboard check interval (default 250)
+--plain-text          sync plain text only; don't carry HTML formatting over
 --background          Windows: detach from the console window
 ```
 
-## Notes and limits (v0.1)
+## Notes and limits (v0.4)
 
-- **Only one item type syncs per copy, chosen in this order: files, then text, then image.**
-  So copying a spreadsheet range sends its text, not a picture of it.
+- **Only one item type syncs per copy, chosen in this order: files, then text (with its
+  HTML formatting, if the app provided any), then image.** So copying a spreadsheet range
+  sends its text and HTML table, not a picture of it.
+- **Formatting travels as HTML.** RTF-only content (some older apps) arrives as plain
+  text. Use `--plain-text` if you'd rather never carry formatting over.
 - **Folders are skipped.** Only files are copied. Zip a folder first if you need it.
 - **Received files pile up.** They accumulate in `ClipBridge Received`; clear it out occasionally.
-- **Rich text and HTML formatting are not carried over yet.** Only plain text syncs.
-- **It's a 1:1 bridge.** If a second machine connects with the right key, it replaces
-  the current connection.
+- **Both machines must run the same version.** v0.2 changed the key derivation and v0.3
+  added pairing; older peers are refused with a message saying so.
+- **A Mac serves one connection at a time.** If a second machine connects to the same
+  Mac with the right key, it replaces the current connection. Windows can connect to
+  several Macs (see "More than one Mac").
 
 ## Layout
 
 ```
-src/main.rs   CLI, clipboard watcher, sessions, reconnect
+src/main.rs   CLI, key storage, pairing flow, clipboard watcher, sessions, reconnect
+src/pair.rs   SPAKE2 pairing with a six-digit code
 src/clip.rs   native clipboard read/write + OS change counters
-src/proto.rs  message format (text / PNG image / files) and content hashing
+src/proto.rs  message format (text / rich text / PNG image / files) and content hashing
 src/net.rs    handshake, key derivation, encrypted framing
 ```
