@@ -11,6 +11,7 @@ mod proto;
 
 use clap::{Parser, Subcommand};
 use proto::{Content, Message};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::net::{Ipv6Addr, Shutdown, TcpListener, TcpStream, ToSocketAddrs};
@@ -121,27 +122,35 @@ enum Cmd {
         #[arg(long)]
         pair: bool,
     },
-    /// Connect to the listening machine (run this on Windows). Reconnects automatically.
-    /// The first time it asks for the pairing code shown by the listener.
+    /// Connect to one or more listening machines (run this on Windows). Reconnects
+    /// automatically. Asks for the pairing code of each machine not paired yet.
+    /// With several machines, a copy on any of them reaches all the others.
     Connect {
-        /// Host or host:port of the listener, e.g. my-mac.local, 100.64.1.5:47800 or
+        /// Host or host:port of each listener, e.g. my-mac.local, 100.64.1.5:47800 or
         /// [fd7a:115c::5]:47800 (put IPv6 addresses in brackets when adding a port).
-        addr: String,
-        /// The pairing code shown on the listener, instead of being asked for it.
+        #[arg(required = true, num_args = 1..)]
+        addrs: Vec<String>,
+        /// The pairing code shown on the listener, instead of being asked for it
+        /// (only when a single machine needs pairing).
         #[arg(long)]
         code: Option<String>,
-        /// Pair again even though a key is already stored (replaces it).
+        /// Pair again with every listed machine even if keys are stored (replaces them).
         #[arg(long)]
         pair: bool,
     },
-    /// Pair with the listening machine using the code it shows, save the key, and exit.
-    /// (`connect` does the same the first time; this one is for scripts and installers.)
+    /// Pair with each listed machine that isn't paired yet, save the keys, and exit.
+    /// (`connect` does the same; this one is for scripts and installers.)
     Pair {
-        /// Host or host:port of the listener.
-        addr: String,
-        /// The pairing code shown on the listener, instead of being asked for it.
+        /// Host or host:port of each listener.
+        #[arg(required = true, num_args = 1..)]
+        addrs: Vec<String>,
+        /// The pairing code shown on the listener, instead of being asked for it
+        /// (only when a single machine needs pairing).
         #[arg(long)]
         code: Option<String>,
+        /// Pair again even with machines that already have a stored key.
+        #[arg(long)]
+        force: bool,
     },
     /// Print a random passphrase to use as --key (only for manual setups without pairing).
     Genkey,
@@ -155,11 +164,12 @@ struct Shared {
     last: Mutex<Seen>,
     /// OS change counter produced by our own write of remote content.
     own_change: Mutex<Option<u64>>,
-    /// Outbox of the active session (newest authenticated session wins).
-    out: Mutex<Option<(u64, Arc<Outbox>)>>,
+    /// Outboxes of the active sessions by peer slot, with the session id. A
+    /// listener has one slot (the newest authenticated session wins); a
+    /// connector has one per machine it connects to.
+    out: Mutex<HashMap<usize, (u64, Arc<Outbox>)>>,
     next_id: AtomicU64,
     name: String,
-    psk: [u8; 32],
     /// Largest frame sent or accepted once the peer has authenticated.
     max_frame: usize,
     /// --plain-text: formatting from the peer is dropped too.
@@ -207,33 +217,35 @@ fn main() {
         }
     }
 
-    if let Cmd::Pair { addr, code } = &cli.cmd {
-        match pair_connector(&full_addr(addr), code.clone(), &key_path(&cli)) {
-            Ok(_) => {
-                log!("done. From now on just run: clipbridge connect {addr}");
-                return;
-            }
+    if let Cmd::Pair { addrs, code, force } = &cli.cmd {
+        let peers = match pair_peers(&cli, addrs, code.clone(), *force) {
+            Ok(p) => p,
             Err(e) => {
                 log!("{e}");
                 std::process::exit(2);
             }
+        };
+        if peers.iter().all(|(_, key)| key.is_some()) {
+            log!("done. From now on just run: clipbridge connect {}", addrs.join(" "));
+            return;
         }
+        std::process::exit(2);
     }
 
     // Kept short so the Hello always fits under net::HELLO_FRAME_LIMIT.
     let name: String = cli.name.clone().unwrap_or_else(hostname).chars().take(200).collect();
 
-    // The key: given explicitly, saved by an earlier pairing, or made now by pairing.
-    let key_path = key_path(&cli);
-    let configured = match load_key(&cli, &key_path) {
-        Ok(k) => k,
-        Err(e) => {
-            log!("{e}");
-            std::process::exit(2);
-        }
-    };
-    let (key, listener) = match &cli.cmd {
+    // Keys: given explicitly, saved by an earlier pairing, or made now by pairing.
+    let role = match &cli.cmd {
         Cmd::Listen { bind, pair } => {
+            let key_path = key_path(&cli);
+            let configured = match load_key(&cli, &key_path) {
+                Ok(k) => k,
+                Err(e) => {
+                    log!("{e}");
+                    std::process::exit(2);
+                }
+            };
             let listener = match TcpListener::bind(bind.as_str()) {
                 Ok(l) => l,
                 Err(e) => {
@@ -246,20 +258,24 @@ fn main() {
                 (Some(k), false) => k,
                 _ => pair_listener(&listener, &name, &key_path),
             };
-            (key, Some(listener))
+            Role::Listen(listener, net::psk_from_passphrase(&key))
         }
-        Cmd::Connect { addr, code, pair } => {
-            let key = match (configured, *pair) {
-                (Some(k), false) => k,
-                _ => match pair_connector(&full_addr(addr), code.clone(), &key_path) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        log!("{e}");
-                        std::process::exit(2);
-                    }
-                },
+        Cmd::Connect { addrs, code, pair } => {
+            let peers = match pair_peers(&cli, addrs, code.clone(), *pair) {
+                Ok(p) => p,
+                Err(e) => {
+                    log!("{e}");
+                    std::process::exit(2);
+                }
             };
-            (key, None)
+            let ready: Vec<(String, [u8; 32])> = peers
+                .into_iter()
+                .filter_map(|(addr, key)| key.map(|k| (addr, net::psk_from_passphrase(&k))))
+                .collect();
+            if ready.is_empty() {
+                std::process::exit(2);
+            }
+            Role::Connect(ready)
         }
         Cmd::Genkey | Cmd::Pair { .. } => unreachable!(),
     };
@@ -285,10 +301,9 @@ fn main() {
         clip: Mutex::new(clip),
         last: Mutex::new(Seen::default()),
         own_change: Mutex::new(None),
-        out: Mutex::new(None),
+        out: Mutex::new(HashMap::new()),
         next_id: AtomicU64::new(1),
         name,
-        psk: net::psk_from_passphrase(&key),
         max_frame: frame_limit(cli.max_mb),
         plain_text: cli.plain_text,
     });
@@ -301,11 +316,125 @@ fn main() {
         thread::spawn(move || watch_clipboard(s, poll));
     }
 
-    match cli.cmd {
-        Cmd::Listen { .. } => listen(listener.expect("bound above"), shared),
-        Cmd::Connect { addr, .. } => connect_loop(&addr, shared),
-        Cmd::Genkey | Cmd::Pair { .. } => unreachable!(),
+    match role {
+        Role::Listen(listener, psk) => listen(listener, shared, psk),
+        Role::Connect(peers) => {
+            if peers.len() > 1 {
+                log!("connecting to {} machines; a copy on any of them reaches all the others", peers.len());
+            }
+            let threads: Vec<_> = peers
+                .into_iter()
+                .enumerate()
+                .map(|(slot, (addr, psk))| {
+                    let s = shared.clone();
+                    thread::spawn(move || connect_loop(&addr, s, slot, psk))
+                })
+                .collect();
+            for t in threads {
+                let _ = t.join();
+            }
+        }
     }
+}
+
+/// What this process does once keys are settled.
+enum Role {
+    Listen(TcpListener, [u8; 32]),
+    /// Each machine to connect to, as `host:port`, with its stretched key.
+    Connect(Vec<(String, [u8; 32])>),
+}
+
+/// The key for each machine in `addrs` (as `host:port`), pairing with the ones
+/// that have none yet (or all of them, with `force`). A machine that still has
+/// no key afterwards, because pairing needs a terminal, gets `None`.
+fn pair_peers(
+    cli: &Cli,
+    addrs: &[String],
+    code: Option<String>,
+    force: bool,
+) -> Result<Vec<(String, Option<String>)>, String> {
+    let mut peers = Vec::new();
+    for addr in addrs {
+        let addr = full_addr(addr);
+        let (path, key) = peer_key(cli, &addr, addrs.len() == 1)?;
+        peers.push((addr, path, if force { None } else { key }));
+    }
+    let unpaired = peers.iter().filter(|(_, _, key)| key.is_none()).count();
+    if code.is_some() && unpaired > 1 {
+        return Err("--code works when a single machine needs pairing; leave it out to be asked for each code".into());
+    }
+    let mut out = Vec::new();
+    for (addr, path, key) in peers {
+        let key = match key {
+            Some(k) => Some(k),
+            None => match pair_connector(&addr, code.clone(), &path) {
+                Ok(k) => Some(k),
+                Err(e) => {
+                    log!("{addr}: {e}");
+                    None
+                }
+            },
+        };
+        out.push((addr, key));
+    }
+    Ok(out)
+}
+
+/// Where the key for `addr` (a `host:port`) lives, and the key if there is one.
+/// `--key` and `--key-file` give every machine the same key (a manual setup).
+/// Otherwise each machine has its own file in the keys folder. With a single
+/// machine, a key saved by an older version in the single key file is moved
+/// into the keys folder, so upgrading keeps the pairing.
+fn peer_key(cli: &Cli, addr: &str, single: bool) -> Result<(PathBuf, Option<String>), String> {
+    let explicit = cli.key.as_deref().is_some_and(|k| !k.is_empty())
+        || cli.key_file.as_deref().is_some_and(|p| !p.as_os_str().is_empty());
+    if explicit {
+        let path = key_path(cli);
+        let key = load_key(cli, &path)?;
+        if key.is_none() && !single {
+            return Err(format!(
+                "{} doesn't exist. With several machines, leave out --key-file so each gets its own key.",
+                path.display()
+            ));
+        }
+        return Ok((path, key));
+    }
+    let path = peer_key_path(addr);
+    if !path.is_file() && single {
+        let legacy = default_key_path();
+        if legacy.is_file() {
+            let moved = path.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
+                && std::fs::rename(&legacy, &path).is_ok();
+            if moved {
+                log!("moved the pairing key for {addr} to {}", path.display());
+            } else {
+                return Ok((path, Some(checked_key(read_key_file(&legacy)?)?)));
+            }
+        }
+    }
+    if !path.is_file() {
+        return Ok((path, None));
+    }
+    Ok((path.clone(), Some(checked_key(read_key_file(&path)?)?)))
+}
+
+/// The key file for one machine: keys\<host>_<port>.key next to the default key file.
+fn peer_key_path(addr: &str) -> PathBuf {
+    let safe: String = addr
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c.to_ascii_lowercase() } else { '_' })
+        .collect();
+    let dir = default_key_path().parent().map(Path::to_path_buf).unwrap_or_else(std::env::temp_dir);
+    dir.join("keys").join(format!("{safe}.key"))
+}
+
+fn checked_key(key: String) -> Result<String, String> {
+    if key.chars().count() < MIN_KEY_CHARS {
+        return Err(format!(
+            "The passphrase must be at least {MIN_KEY_CHARS} characters. Generate a strong one with: clipbridge genkey"
+        ));
+    }
+    Ok(key)
 }
 
 /// Where the key lives: --key-file (or CLIPBRIDGE_KEY_FILE), else the default
@@ -333,12 +462,7 @@ fn load_key(cli: &Cli, key_path: &Path) -> Result<Option<String>, String> {
             read_key_file(key_path)?
         }
     };
-    if key.chars().count() < MIN_KEY_CHARS {
-        return Err(format!(
-            "The passphrase must be at least {MIN_KEY_CHARS} characters. Generate a strong one with: clipbridge genkey"
-        ));
-    }
-    Ok(Some(key))
+    Ok(Some(checked_key(key)?))
 }
 
 fn read_key_file(path: &Path) -> Result<String, String> {
@@ -472,7 +596,7 @@ fn pair_connector(addr: &str, code: Option<String>, key_path: &Path) -> Result<S
         let typed = match &code {
             Some(c) => c.clone(),
             None => {
-                eprint!("Enter the pairing code shown on the other machine: ");
+                eprint!("Enter the pairing code shown on {addr}: ");
                 let _ = io::stderr().flush();
                 let mut line = String::new();
                 io::stdin().lock().read_line(&mut line).map_err(|e| format!("couldn't read the code: {e}"))?;
@@ -600,20 +724,39 @@ fn watch_clipboard(shared: Arc<Shared>, poll: Duration) {
             last.remember(&content, h);
         }
         let desc = content.describe();
-        let outbox = lock(&shared.out).as_ref().map(|(_, o)| o.clone());
-        match outbox {
-            Some(o) => {
-                log!("→ sending {desc}");
-                if o.put(content) {
-                    log!("(dropped an older clipboard item that hadn't been sent yet)");
-                }
-            }
-            None => log!("copied {desc} (no peer connected)"),
+        match broadcast(&shared, content, None) {
+            0 => log!("copied {desc} (no peer connected)"),
+            1 => log!("→ sending {desc}"),
+            n => log!("→ sending {desc} to {n} machines"),
         }
     }
 }
 
-fn apply_remote(shared: &Shared, content: Content) {
+/// Queue `content` for every connected peer except the one in slot `except`.
+/// Returns how many peers it was queued for.
+fn broadcast(shared: &Shared, content: Content, except: Option<usize>) -> usize {
+    let outboxes: Vec<Arc<Outbox>> = lock(&shared.out)
+        .iter()
+        .filter(|(slot, _)| Some(**slot) != except)
+        .map(|(_, (_, o))| o.clone())
+        .collect();
+    let n = outboxes.len();
+    let mut content = Some(content);
+    for (i, o) in outboxes.into_iter().enumerate() {
+        // Only clone for all but the last peer: file batches can be large.
+        let item = if i + 1 == n { content.take() } else { content.clone() };
+        if let Some(item) = item
+            && o.put(item)
+        {
+            log!("(dropped an older clipboard item that hadn't been sent yet)");
+        }
+    }
+    n
+}
+
+/// `from` is the slot of the peer that sent it; on a machine connected to
+/// several peers, the content is passed on to all the others.
+fn apply_remote(shared: &Shared, content: Content, from: usize) {
     let content = if shared.plain_text { content.into_plain() } else { content };
     if content.is_file_url_list() {
         log!("← ignored a list of file:// links (they point at the other machine's disk)");
@@ -632,19 +775,25 @@ fn apply_remote(shared: &Shared, content: Content) {
         }
         last.remember(&content, h);
     }
-    let mut clip = lock(&shared.clip);
-    match clip.write(&content) {
-        Ok(()) => {
-            *lock(&shared.own_change) = clip::change_count();
-            log!("← received {desc}");
+    {
+        let mut clip = lock(&shared.clip);
+        match clip.write(&content) {
+            Ok(()) => {
+                *lock(&shared.own_change) = clip::change_count();
+                log!("← received {desc}");
+            }
+            Err(e) => log!("← received {desc} but couldn't put it on the clipboard: {e}"),
         }
-        Err(e) => log!("← received {desc} but couldn't put it on the clipboard: {e}"),
+    }
+    let n = broadcast(shared, content, Some(from));
+    if n > 0 {
+        log!("→ passed it on to {n} other machine(s)");
     }
 }
 
 // ---------- networking ----------
 
-fn listen(listener: TcpListener, shared: Arc<Shared>) {
+fn listen(listener: TcpListener, shared: Arc<Shared>, psk: [u8; 32]) {
     let pending = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         match conn {
@@ -657,7 +806,8 @@ fn listen(listener: TcpListener, shared: Arc<Shared>) {
                 };
                 let s = shared.clone();
                 thread::spawn(move || {
-                    match run_session(stream, net::Role::Listener, &s, Some(slot)) {
+                    // Slot 0: a listener serves one peer at a time, newest wins.
+                    match run_session(stream, net::Role::Listener, &s, 0, &psk, Some(slot)) {
                         Ok(()) => log!("{peer} disconnected"),
                         Err(e) => log!("{peer}: {e}"),
                     }
@@ -760,14 +910,14 @@ fn full_addr(addr: &str) -> String {
     }
 }
 
-fn connect_loop(addr: &str, shared: Arc<Shared>) {
-    let addr = full_addr(addr);
+/// Keep a session to `addr` (a `host:port`) open, reconnecting as needed.
+fn connect_loop(addr: &str, shared: Arc<Shared>, slot: usize, psk: [u8; 32]) {
     let mut backoff = Duration::from_secs(2);
     loop {
         let started = Instant::now();
         let result = (|| -> io::Result<()> {
-            let stream = connect_any(&addr)?;
-            run_session(stream, net::Role::Connector, &shared, None)
+            let stream = connect_any(addr)?;
+            run_session(stream, net::Role::Connector, &shared, slot, &psk, None)
         })();
         match result {
             Ok(()) => log!("disconnected from {addr}"),
@@ -795,18 +945,20 @@ fn connect_any(addr: &str) -> io::Result<TcpStream> {
     Err(last_err.unwrap_or_else(|| io::Error::other("could not resolve address")))
 }
 
-/// `pending` is the listener's unauthenticated-connection slot, released once
-/// the peer's Hello has been verified.
+/// `slot` identifies the peer in `Shared::out`; `pending` is the listener's
+/// unauthenticated-connection slot, released once the peer's Hello is verified.
 fn run_session(
     mut stream: TcpStream,
     role: net::Role,
     shared: &Arc<Shared>,
+    slot: usize,
+    psk: &[u8; 32],
     mut pending: Option<PendingSlot>,
 ) -> io::Result<()> {
     let peer_addr = stream.peer_addr()?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(HELLO_TIMEOUT))?;
-    let (mut sealer, mut opener) = net::handshake(&mut stream, role, &shared.psk)?;
+    let (mut sealer, mut opener) = net::handshake(&mut stream, role, psk)?;
 
     let outbox = Arc::new(Outbox::new());
     let mut wstream = stream.try_clone()?;
@@ -857,7 +1009,7 @@ fn run_session(
         drop(pending.take());
         opener.set_max_frame(shared.max_frame);
         stream.set_read_timeout(Some(PEER_TIMEOUT))?;
-        let previous = lock(&shared.out).replace((id, outbox.clone()));
+        let previous = lock(&shared.out).insert(slot, (id, outbox.clone()));
         if let Some((_, old)) = previous {
             old.close(); // stops the old session's writer, which ends that session
         }
@@ -867,15 +1019,15 @@ fn run_session(
             let frame = opener.read_frame(&mut stream)?;
             match Message::decode(&frame)? {
                 Message::Ping | Message::Hello { .. } => {}
-                Message::Clip(content) => apply_remote(shared, content),
+                Message::Clip(content) => apply_remote(shared, content, slot),
             }
         }
     })();
 
     {
         let mut out = lock(&shared.out);
-        if matches!(out.as_ref(), Some((cur, _)) if *cur == id) {
-            *out = None;
+        if matches!(out.get(&slot), Some((cur, _)) if *cur == id) {
+            out.remove(&slot);
         }
     }
     outbox.close();

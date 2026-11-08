@@ -61,11 +61,23 @@ sends them as PNG, and writes them back natively. On Windows that means writing 
 That's it. The key agreed during pairing is saved on both machines and used from then on:
 
 - Mac: `~/.config/clipbridge/key`
-- Windows: `%LOCALAPPDATA%\ClipBridge\key.txt`
+- Windows: one file per Mac in `%LOCALAPPDATA%\ClipBridge\keys\`
 
-Both files are readable only by your account. To pair with a different machine later,
-run `clipbridge listen --pair` on the Mac (and `clipbridge connect <mac> --pair` on
-Windows): a fresh code replaces the stored key.
+All of them are readable only by your account. To pair with a different machine later,
+run `clipbridge listen --pair` on the Mac and `clipbridge pair <mac> --force` on
+Windows: a fresh code replaces the stored key.
+
+## More than one Mac
+
+Windows can sync with several Macs at once. List them all on `connect`:
+```
+clipbridge connect 192.168.1.20 192.168.1.31
+```
+Each Mac runs `clipbridge listen` as usual and is paired on its own: Windows asks for
+the code of every Mac it has no key for yet. Every copy on Windows goes to all the
+Macs, and a copy on one Mac goes to Windows and on to the other Macs, so all the
+clipboards stay the same. Windows is the hub: if it isn't running, the Macs don't
+sync with each other.
 
 ## Run automatically
 
@@ -78,12 +90,13 @@ The log is at `/tmp/clipbridge.log`. While the agent runs, you can't pair in a t
 at the same time (the port is taken); pair first, or stop the agent with
 `launchctl bootout gui/$(id -u)/com.simplebit.clipbridge`.
 
-**Windows:** put `clipbridge.exe` next to the script, make sure the Mac is showing a
-pairing code if you haven't paired yet, then in PowerShell:
+**Windows:** put `clipbridge.exe` next to the script, make sure any Mac you haven't
+paired yet is showing a pairing code, then in PowerShell:
 ```
 .\install\windows\install-startup.ps1 -MacHost brians-mbp.local
 ```
-It pairs if needed (you type the code), then registers a logon task that runs hidden and
+For several Macs, separate them with commas: `-MacHost 192.168.1.20, 192.168.1.31`.
+It pairs each Mac that needs it (you type the codes), then registers a logon task that runs hidden and
 keeps reconnecting. A console window may flash briefly at logon. The log is at
 `%LOCALAPPDATA%\ClipBridge\clipbridge.log`.
 
@@ -120,8 +133,8 @@ with `--key-file <path>` or `--key <secret>` on both machines; then no pairing h
 
 ```
 clipbridge listen [bind] [--pair]
-clipbridge connect <host> [--code 483912] [--pair]
-clipbridge pair <host> [--code 483912]     pair and exit (used by the Windows installer)
+clipbridge connect <host>... [--code 483912] [--pair]
+clipbridge pair <host>... [--code 483912] [--force]   pair the unpaired hosts and exit
 
 --key-file <path>     where the key is kept (default: the paths above; or CLIPBRIDGE_KEY_FILE)
 --key <secret>        use this passphrase instead of a stored key (or CLIPBRIDGE_KEY)
@@ -134,7 +147,7 @@ clipbridge pair <host> [--code 483912]     pair and exit (used by the Windows in
 --background          Windows: detach from the console window
 ```
 
-## Notes and limits (v0.3)
+## Notes and limits (v0.4)
 
 - **Only one item type syncs per copy, chosen in this order: files, then text (with its
   HTML formatting, if the app provided any), then image.** So copying a spreadsheet range
@@ -145,8 +158,9 @@ clipbridge pair <host> [--code 483912]     pair and exit (used by the Windows in
 - **Received files pile up.** They accumulate in `ClipBridge Received`; clear it out occasionally.
 - **Both machines must run the same version.** v0.2 changed the key derivation and v0.3
   added pairing; older peers are refused with a message saying so.
-- **It's a 1:1 bridge.** If a second machine connects with the right key, it replaces
-  the current connection, and pairing again replaces the stored key.
+- **A Mac serves one connection at a time.** If a second machine connects to the same
+  Mac with the right key, it replaces the current connection. Windows can connect to
+  several Macs (see "More than one Mac").
 
 ## Layout
 
