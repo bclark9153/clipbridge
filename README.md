@@ -26,9 +26,16 @@ sends them as PNG, and writes them back natively. On Windows that means writing 
 
 ## Quick start
 
-1. **Get the binary** for each machine from the **Actions** tab of this repo (every push
-   builds Windows, Apple Silicon and Intel Mac versions), or build it yourself with
-   [Rust](https://rustup.rs): `cargo build --release`.
+1. **Install it.** On each Mac, in Terminal:
+   ```
+   curl -fsSL https://github.com/bclark9153/clipbridge/releases/latest/download/install.sh | sh
+   ```
+   It picks the Apple Silicon or Intel build from the latest release and installs it to
+   `/usr/local/bin` (run it again to upgrade). On Windows, download
+   `clipbridge-windows-x86_64.exe` from the
+   [latest release](https://github.com/bclark9153/clipbridge/releases/latest) and rename
+   it to `clipbridge.exe`. Every push also builds all three in the **Actions** tab, or
+   build it yourself with [Rust](https://rustup.rs): `cargo build --release`.
 
 2. **On the Mac**, run it. It listens on TCP 47800 and, since it has no key yet, shows a
    pairing code:
@@ -81,7 +88,7 @@ sync with each other.
 
 ## Run automatically
 
-**Mac:** copy `clipbridge` to `/usr/local/bin`, pair once as above, then:
+**Mac:** install with the `curl` command above, pair once, then:
 ```
 cp install/macos/com.simplebit.clipbridge.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.simplebit.clipbridge.plist
