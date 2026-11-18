@@ -1,9 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Copy to ~/Library/LaunchAgents/ and load with:
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.simplebit.clipbridge.plist
-  Replace REPLACE_WITH_KEY with the output of `clipbridge genkey`.
+  1. Copy clipbridge to /usr/local/bin.
+  2. Pair once: run `clipbridge listen` in Terminal, enter the code it shows on the
+     Windows machine, and quit it with Ctrl-C once both sides say "connected".
+     The key is saved in ~/.config/clipbridge/key and reused from then on.
+  3. Copy this file to ~/Library/LaunchAgents/ and load it with:
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.simplebit.clipbridge.plist
+
+  To pair with a different machine later, stop the agent and run
+  `clipbridge listen -pair` once in Terminal (two dashes before pair).
+
   It must be a LaunchAgent (runs in your login session), not a LaunchDaemon,
   or it can't see your clipboard.
 -->
@@ -18,11 +25,6 @@
     <string>--log</string>
     <string>/tmp/clipbridge.log</string>
   </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>CLIPBRIDGE_KEY</key>
-    <string>REPLACE_WITH_KEY</string>
-  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
