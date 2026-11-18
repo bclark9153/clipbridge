@@ -15,6 +15,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# The same Mac listed twice would get two connections that keep replacing each other.
+$MacHost = @($MacHost | ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -Unique)
+
 $dataDir = "$env:LOCALAPPDATA\ClipBridge"
 New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
 

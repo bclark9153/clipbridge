@@ -226,7 +226,8 @@ fn main() {
             }
         };
         if peers.iter().all(|(_, key)| key.is_some()) {
-            log!("done. From now on just run: clipbridge connect {}", addrs.join(" "));
+            let hosts: Vec<&str> = peers.iter().map(|(addr, _)| addr.as_str()).collect();
+            log!("done. From now on just run: clipbridge connect {}", hosts.join(" "));
             return;
         }
         std::process::exit(2);
@@ -353,11 +354,21 @@ fn pair_peers(
     code: Option<String>,
     force: bool,
 ) -> Result<Vec<(String, Option<String>)>, String> {
-    let mut peers = Vec::new();
+    // The same machine listed twice would get two sessions that keep replacing
+    // each other on the listener, so drop repeats.
+    let mut unique: Vec<String> = Vec::new();
     for addr in addrs {
         let addr = full_addr(addr);
-        let (path, key) = peer_key(cli, &addr, addrs.len() == 1)?;
-        peers.push((addr, path, if force { None } else { key }));
+        if unique.contains(&addr) {
+            log!("{addr} is listed more than once; connecting to it once");
+        } else {
+            unique.push(addr);
+        }
+    }
+    let mut peers = Vec::new();
+    for addr in &unique {
+        let (path, key) = peer_key(cli, addr, unique.len() == 1)?;
+        peers.push((addr.clone(), path, if force { None } else { key }));
     }
     let unpaired = peers.iter().filter(|(_, _, key)| key.is_none()).count();
     if code.is_some() && unpaired > 1 {
