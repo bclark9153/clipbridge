@@ -33,5 +33,12 @@ $SUDO install -m 755 "$TMP" "$DEST/clipbridge"
 $SUDO xattr -c "$DEST/clipbridge" 2>/dev/null || true
 
 echo "Installed $("$DEST/clipbridge" --version) to $DEST/clipbridge"
-echo
-echo "Next: run   clipbridge listen   and enter the pairing code it shows on your Windows PC."
+
+# Upgrading: restart the background service so the new version runs now.
+if launchctl kickstart -k "gui/$(id -u)/com.simplebit.clipbridge" 2>/dev/null; then
+  echo "Restarted the ClipBridge background service."
+else
+  echo
+  echo "Next: run   clipbridge listen   and enter the pairing code it shows on your Windows PC."
+  echo "(If ClipBridge is already running in a Terminal window, press Ctrl-C there and start it again.)"
+fi

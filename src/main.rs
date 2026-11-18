@@ -164,6 +164,10 @@ struct Shared {
     last: Mutex<Seen>,
     /// OS change counter produced by our own write of remote content.
     own_change: Mutex<Option<u64>>,
+    /// Remote content most recently put on the clipboard, to put back if another
+    /// app empties the clipboard soon after (Jump Desktop can, when its window
+    /// gets focus and the other side's clipboard holds something it can't carry).
+    applied: Mutex<Option<Applied>>,
     /// Outboxes of the active sessions by peer slot, with the session id. A
     /// listener has one slot (the newest authenticated session wins); a
     /// connector has one per machine it connects to.
@@ -175,6 +179,17 @@ struct Shared {
     /// --plain-text: formatting from the peer is dropped too.
     plain_text: bool,
 }
+
+struct Applied {
+    at: Instant,
+    content: Content,
+    restores: u32,
+}
+
+/// How long after receiving something it may be put back if the clipboard is
+/// emptied, and how often.
+const REAPPLY_WINDOW: Duration = Duration::from_secs(60);
+const MAX_REAPPLY: u32 = 3;
 
 /// Hashes of the content most recently sent or applied.
 #[derive(Default)]
@@ -302,6 +317,7 @@ fn main() {
         clip: Mutex::new(clip),
         last: Mutex::new(Seen::default()),
         own_change: Mutex::new(None),
+        applied: Mutex::new(None),
         out: Mutex::new(HashMap::new()),
         next_id: AtomicU64::new(1),
         name,
@@ -707,7 +723,10 @@ fn watch_clipboard(shared: Arc<Shared>, poll: Duration) {
         }
 
         let content = lock(&shared.clip).read(has_counter);
-        let Some(content) = content else { continue };
+        let Some(content) = content else {
+            reapply_if_emptied(&shared);
+            continue;
+        };
         if content.is_file_url_list() {
             // Another tool's text version of a file copy (Jump Desktop's clipboard
             // sharing does this). Put the real files back if we have them, so a
@@ -734,12 +753,42 @@ fn watch_clipboard(shared: Arc<Shared>, poll: Duration) {
             }
             last.remember(&content, h);
         }
+        // A new local copy: nothing received earlier should come back over it.
+        *lock(&shared.applied) = None;
         let desc = content.describe();
         match broadcast(&shared, content, None) {
             0 => log!("copied {desc} (no peer connected)"),
             1 => log!("→ sending {desc}"),
             n => log!("→ sending {desc} to {n} machines"),
         }
+    }
+}
+
+/// The clipboard changed and nothing readable is on it. If that happened soon
+/// after we put received content there, another app emptied it: put it back.
+fn reapply_if_emptied(shared: &Shared) {
+    let mut applied = lock(&shared.applied);
+    let Some(a) = applied.as_mut() else { return };
+    // Files have their own path (`Clip::restore_files`); rewriting them here
+    // would save another copy of every file.
+    if matches!(a.content, Content::Files(_)) || a.at.elapsed() > REAPPLY_WINDOW || a.restores >= MAX_REAPPLY {
+        return;
+    }
+    let mut clip = lock(&shared.clip);
+    if !clip.looks_empty() {
+        return;
+    }
+    a.restores += 1;
+    let desc = a.content.describe();
+    match clip.write(&a.content) {
+        Ok(()) => {
+            *lock(&shared.own_change) = clip::change_count();
+            log!(
+                "another app emptied the clipboard {}s after ClipBridge put {desc} on it; put it back",
+                a.at.elapsed().as_secs()
+            );
+        }
+        Err(e) => log!("couldn't put {desc} back on the clipboard: {e}"),
     }
 }
 
@@ -791,6 +840,7 @@ fn apply_remote(shared: &Shared, content: Content, from: usize) {
         match clip.write(&content) {
             Ok(()) => {
                 *lock(&shared.own_change) = clip::change_count();
+                *lock(&shared.applied) = Some(Applied { at: Instant::now(), content: content.clone(), restores: 0 });
                 log!("← received {desc}");
             }
             Err(e) => log!("← received {desc} but couldn't put it on the clipboard: {e}"),

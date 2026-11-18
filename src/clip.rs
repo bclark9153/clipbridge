@@ -53,6 +53,90 @@ pub fn change_count() -> Option<u64> {
     None
 }
 
+/// An image the clipboard holds only as PNG. On macOS arboard reads images as
+/// TIFF only, but screenshots (⌃⇧⌘4) and many apps put just PNG there.
+#[cfg(target_os = "macos")]
+fn platform_png_image() -> Option<Content> {
+    let png = mac::read_png()?;
+    let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png).ok()?.to_rgba8();
+    let (width, height) = img.dimensions();
+    (width > 0 && height > 0).then(|| Content::Image { width, height, rgba: img.into_raw() })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_png_image() -> Option<Content> {
+    None
+}
+
+/// Add a PNG version next to the image arboard just wrote. On macOS arboard
+/// writes TIFF only, which some apps (browsers among them) won't paste.
+#[cfg(target_os = "macos")]
+fn add_platform_png(width: u32, height: u32, rgba: &[u8]) {
+    use image::ImageEncoder;
+    let mut png = Vec::new();
+    let encoded = image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(rgba, width, height, image::ExtendedColorType::Rgba8);
+    if encoded.is_err() || !mac::add_png(&png) {
+        log!("couldn't add a PNG version of the image to the clipboard (TIFF only)");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn add_platform_png(_width: u32, _height: u32, _rgba: &[u8]) {}
+
+/// The bits of NSPasteboard arboard doesn't cover.
+#[cfg(target_os = "macos")]
+mod mac {
+    use objc2::rc::autoreleasepool;
+    use objc2::runtime::{AnyObject, Bool};
+    use objc2::{class, msg_send};
+    use std::ffi::{CStr, c_void};
+
+    const PNG_TYPE: &CStr = c"public.png";
+
+    unsafe fn ns_string(s: &CStr) -> *mut AnyObject {
+        unsafe { msg_send![class!(NSString), stringWithUTF8String: s.as_ptr()] }
+    }
+
+    /// The PNG data on the general pasteboard, if there is any.
+    pub fn read_png() -> Option<Vec<u8>> {
+        autoreleasepool(|_| unsafe {
+            let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+            if pb.is_null() {
+                return None;
+            }
+            let ty = ns_string(PNG_TYPE);
+            let data: *mut AnyObject = msg_send![pb, dataForType: ty];
+            if data.is_null() {
+                return None;
+            }
+            let len: usize = msg_send![data, length];
+            let bytes: *const c_void = msg_send![data, bytes];
+            if bytes.is_null() || len == 0 {
+                return None;
+            }
+            Some(std::slice::from_raw_parts(bytes.cast::<u8>(), len).to_vec())
+        })
+    }
+
+    /// Add PNG data to the item already on the general pasteboard.
+    pub fn add_png(png: &[u8]) -> bool {
+        autoreleasepool(|_| unsafe {
+            let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+            if pb.is_null() {
+                return false;
+            }
+            let ty = ns_string(PNG_TYPE);
+            let types: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: ty];
+            let _: isize = msg_send![pb, addTypes: types, owner: std::ptr::null_mut::<AnyObject>()];
+            let data: *mut AnyObject =
+                msg_send![class!(NSData), dataWithBytes: png.as_ptr().cast::<c_void>(), length: png.len()];
+            let ok: Bool = msg_send![pb, setData: data, forType: ty];
+            ok.as_bool()
+        })
+    }
+}
+
 /// Normalize line endings to LF (the form text is hashed and sent in).
 fn to_lf(s: &str) -> String {
     s.replace("\r\n", "\n")
@@ -132,6 +216,16 @@ impl Clip {
         }
     }
 
+    /// True when there is nothing ClipBridge can read on the clipboard: no files,
+    /// text, image or HTML. Another app emptying the clipboard looks like this.
+    pub fn looks_empty(&mut self) -> bool {
+        self.file_list().is_none()
+            && !self.cb.get_text().is_ok_and(|t| !t.is_empty())
+            && self.cb.get_image().is_err()
+            && platform_png_image().is_none()
+            && !self.cb.get().html().is_ok_and(|h| !h.is_empty())
+    }
+
     fn note_paths(&mut self, paths: Vec<PathBuf>, received: bool) {
         self.last_paths = paths;
         self.paths_at = Some(Instant::now());
@@ -187,6 +281,9 @@ impl Clip {
                     rgba: img.bytes.into_owned(),
                 });
             }
+        if let Some(img) = platform_png_image() {
+            return Some(img);
+        }
         // HTML with no plain-text version (some scripts and clipboard tools do
         // this). Checked after images so a copied browser image, which also
         // carries an <img> snippet, still syncs as a picture.
@@ -252,14 +349,17 @@ impl Clip {
                 }
                 Ok(())
             }
-            Content::Image { width, height, rgba } => self
-                .cb
-                .set_image(ImageData {
-                    width: *width as usize,
-                    height: *height as usize,
-                    bytes: Cow::Borrowed(rgba),
-                })
-                .map_err(|e| e.to_string()),
+            Content::Image { width, height, rgba } => {
+                self.cb
+                    .set_image(ImageData {
+                        width: *width as usize,
+                        height: *height as usize,
+                        bytes: Cow::Borrowed(rgba),
+                    })
+                    .map_err(|e| e.to_string())?;
+                add_platform_png(*width, *height, rgba);
+                Ok(())
+            }
             Content::Files(files) => {
                 let paths = self.save_files(files).map_err(|e| e.to_string())?;
                 self.note_paths(paths.clone(), true);
